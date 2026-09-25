@@ -144,6 +144,7 @@ ghcr.io/tkubica12/aca-sandbox-copilot:latest
 
 - [Architecture and security](docs/architecture.md)
 - [Operations, configuration, and testing](docs/operations.md)
+- [Separate personal Hermes pilot and deployment gates](docs/hermes.md)
 
 ## Cleanup
 

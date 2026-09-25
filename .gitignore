@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.sample
+!.env.hermes.sample
 .DS_Store
 Thumbs.db
 .idea/
@@ -10,5 +11,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv-hermes/
 dist/
 build/

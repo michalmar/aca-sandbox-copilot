@@ -1,0 +1,106 @@
+name: Build Hermes sandbox image (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Explicitly publish the separate Hermes image to GHCR
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}-hermes
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.publish.outputs.image_digest }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Generate immutable time tag
+        id: version
+        shell: bash
+        run: echo "tag=$(date -u +'%Y%m%d-%H%M%S')-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Build the independent Hermes image
+        uses: docker/build-push-action@v7
+        with:
+          context: hermes/image
+          target: final
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: hermes-offline-verification:local
+          cache-from: type=gha,scope=hermes
+          cache-to: type=gha,scope=hermes,mode=max
+
+      - name: Verify the exact image offline before publication
+        shell: bash
+        run: |
+          docker run --rm --platform linux/amd64 --network none --cpus 2 --memory 4g \
+            --tmpfs /mnt/data:rw,size=1073741824,mode=700 \
+            --mount type=bind,src="$GITHUB_WORKSPACE/tests",dst=/runtime-tests,readonly \
+            --mount type=bind,src="$GITHUB_WORKSPACE",dst=/test-repo,readonly \
+            -e PYTHONPATH=/runtime-tests:/opt/hermes-sandbox:/opt/hermes-sandbox/google:/opt/hermes \
+            -e HERMES_RUNTIME_IMAGE_TESTS=1 --entrypoint bash hermes-offline-verification:local \
+            -c 'set -euo pipefail; uv --no-config pip check --python /opt/hermes/.venv/bin/python; cd /opt/hermes-sandbox; node --test tests/bridge_policy.test.mjs; /opt/hermes/.venv/bin/python -m unittest discover -s /runtime-tests -p "test_hermes_runtime_*.py" -v'
+
+      - name: Verify production boot and disk reserve on a separate fresh mount
+        shell: bash
+        run: |
+          docker run --rm --platform linux/amd64 --network none --cpus 2 --memory 4g \
+            --tmpfs /mnt/data:rw,size=1073741824,mode=700 \
+            --mount type=bind,src="$GITHUB_WORKSPACE/tests",dst=/runtime-tests,readonly \
+            -e PYTHONPATH=/runtime-tests:/opt/hermes-sandbox:/opt/hermes-sandbox/google:/opt/hermes \
+            -e HERMES_ENTRYPOINT_IMAGE_TEST=1 \
+            --entrypoint /opt/hermes/.venv/bin/python hermes-offline-verification:local \
+            -m unittest test_hermes_deploy_image -v
+
+      - name: Build and check the separate SDK verification target before publication
+        uses: docker/build-push-action@v7
+        with:
+          context: hermes/image
+          target: verification
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: hermes-sdk-verification:local
+          cache-from: type=gha,scope=hermes
+          cache-to: type=gha,scope=hermes,mode=max
+
+      - name: Log in only after verification for an explicitly requested publication
+        if: inputs.publish
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the verified image
+        id: publish
+        if: inputs.publish
+        shell: bash
+        run: |
+          docker tag hermes-offline-verification:local "$IMAGE_NAME:${{ steps.version.outputs.tag }}"
+          docker push "$IMAGE_NAME:${{ steps.version.outputs.tag }}"
+          reference=$(docker image inspect "$IMAGE_NAME:${{ steps.version.outputs.tag }}" \
+            --format '{{index .RepoDigests 0}}')
+          test "${reference%%@*}" = "$IMAGE_NAME"
+          printf '%s\n' "${reference#*@}" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          echo "image_digest=$reference" >> "$GITHUB_OUTPUT"
+          printf 'Verified Hermes image: `%s`\n' "$reference" >> "$GITHUB_STEP_SUMMARY"

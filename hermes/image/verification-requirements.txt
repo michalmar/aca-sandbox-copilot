@@ -1,0 +1,2 @@
+azure-containerapps-sandbox==0.1.0b4
+azure-mgmt-resource==24.0.0
