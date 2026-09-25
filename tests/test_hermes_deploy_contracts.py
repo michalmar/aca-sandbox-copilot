@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,9 +19,11 @@ from azure.core.exceptions import HttpResponseError, ResourceNotFoundError, Serv
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+import access_hermes
 import cleanup_hermes
 import deploy_hermes
 import hermes_common as common
+import test_hermes
 
 
 def config(**changes):
@@ -35,6 +38,7 @@ def config(**changes):
         "whatsapp_phone": "+420123456789",
         "identity_host": "identity.platform.invalid",
         "whatsapp_hosts": ("web.whatsapp.com",),
+        "egress_mode": "allow-all-mvp",
     }
     return common.Config(**(values | changes))
 
@@ -141,6 +145,104 @@ class ConfigurationTests(unittest.TestCase):
             common.assert_labels({**common.LABELS, "hermes-deployment": own.sandbox_name}, own, "resource group")
 
 
+class ExplicitEgressModeTests(unittest.TestCase):
+    def test_missing_unknown_and_unverified_modes_fail_before_config_or_azure(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+            path = Path(directory) / ".env.hermes"
+            for mode in (None, "", "allow-all", "Allow-all-mvp", "allow-all-mvp-secret-canary", "hardened-unverified"):
+                path.write_text("" if mode is None else f"HERMES_EGRESS_MODE={mode}\n")
+                for entrypoint in (deploy_hermes, test_hermes, access_hermes):
+                    with (
+                        self.subTest(mode=mode, entrypoint=entrypoint.__name__),
+                        patch.object(common.Config, "from_values") as construct,
+                        patch.object(common.AzureClients, "create") as azure,
+                        patch.object(sys, "argv", ["script", "--env-file", str(path)]),
+                        self.assertRaisesRegex(RuntimeError, "HERMES_EGRESS_MODE") as raised,
+                    ):
+                        entrypoint.main()
+                    construct.assert_not_called()
+                    azure.assert_not_called()
+                    self.assertNotIn("secret-canary", str(raised.exception))
+
+    def test_programmatic_deploy_and_check_require_opt_in_before_any_clients(self):
+        for mode in ("", "unknown", "hardened-unverified"):
+            for operation in (deploy_hermes.deploy, test_hermes.inspect_deployment):
+                clients = MagicMock()
+                with self.subTest(mode=mode, operation=operation.__name__), self.assertRaises(RuntimeError):
+                    operation(config(egress_mode=mode), clients)
+                self.assertEqual(clients.mock_calls, [])
+
+    def test_valid_opt_in_is_read_once_before_config_construction(self):
+        values = {
+            "HERMES_SUBSCRIPTION_ID": config().subscription_id,
+            "HERMES_TENANT_ID": config().tenant_id,
+            "HERMES_OWNER_OBJECT_ID": config().owner_object_id,
+            "HERMES_EGRESS_MODE": common.MVP_EGRESS_MODE,
+        }
+        with patch.object(common, "_read_env", return_value=values) as read:
+            loaded = common.load_egress_config(Path("chosen.env.hermes"))
+        read.assert_called_once_with(Path("chosen.env.hermes"))
+        self.assertEqual(loaded.egress_mode, common.MVP_EGRESS_MODE)
+
+    def test_environment_opt_in_is_deliberate_and_invalid_override_does_not_fall_back_to_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env.hermes"
+            path.write_text(
+                f"HERMES_SUBSCRIPTION_ID={config().subscription_id}\n"
+                f"HERMES_TENANT_ID={config().tenant_id}\n"
+                f"HERMES_OWNER_OBJECT_ID={config().owner_object_id}\n"
+                "HERMES_EGRESS_MODE=\n"
+            )
+            with patch.dict(os.environ, {"HERMES_EGRESS_MODE": "allow-all-mvp"}, clear=True):
+                with self.assertLogs("hermes.config", level="WARNING"):
+                    loaded = common.load_egress_config(path)
+            self.assertEqual(loaded.egress_mode, common.MVP_EGRESS_MODE)
+            path.write_text(path.read_text().replace("HERMES_EGRESS_MODE=\n", "HERMES_EGRESS_MODE=allow-all-mvp\n"))
+            with patch.dict(os.environ, {"HERMES_EGRESS_MODE": "private-invalid-mode"}, clear=True):
+                with self.assertLogs("hermes.config", level="WARNING") as captured:
+                    with self.assertRaisesRegex(RuntimeError, "explicitly set") as raised:
+                        common.load_egress_config(path)
+            self.assertIn("HERMES_EGRESS_MODE", "\n".join(captured.output))
+            self.assertNotIn("private-invalid-mode", "\n".join(captured.output) + str(raised.exception))
+
+    def test_future_hardened_contract_is_not_an_allow_or_inspection_fallback(self):
+        with self.assertRaises(RuntimeError) as raised:
+            common.require_egress_mode("hardened-unverified")
+        self.assertIn("Partial + Deny was rejected", str(raised.exception))
+        self.assertIn("Full + Deny remains unverified", str(raised.exception))
+        self.assertIn("our diagnostics", str(raised.exception))
+        self.assertIn("no automatic fallback", str(raised.exception))
+
+    def test_cleanup_can_load_missing_or_unusable_mode_without_accepting_unrestricted_access(self):
+        values = {
+            "HERMES_SUBSCRIPTION_ID": config().subscription_id,
+            "HERMES_TENANT_ID": config().tenant_id,
+            "HERMES_OWNER_OBJECT_ID": config().owner_object_id,
+        }
+        for mode in ("", "hardened-unverified", "typo"):
+            with self.subTest(mode=mode), patch.object(common, "_read_env", return_value={
+                **values, "HERMES_EGRESS_MODE": mode,
+            }):
+                loaded = common.Config.from_env()
+            self.assertEqual(loaded.egress_mode, mode)
+            clients = MagicMock()
+            clients.resources.resource_groups.check_existence.return_value = False
+            with patch.object(cleanup_hermes, "assert_owner"), redirect_stdout(io.StringIO()):
+                cleanup_hermes.cleanup(loaded, clients)
+            clients.resources.resource_groups.check_existence.assert_called_once_with(loaded.resource_group)
+            clients.group._dp_put.assert_not_called()
+            clients.group._dp_post.assert_not_called()
+
+    def test_warning_names_the_privacy_risk_and_does_not_claim_tool_controls_are_isolation(self):
+        with self.assertLogs("hermes.egress", level="WARNING") as captured:
+            common.warn_unrestricted_egress("allow-all-mvp")
+        output = "\n".join(captured.output)
+        for text in ("TEMPORARY", "NO outbound network isolation", "All internet destinations",
+                     "no TLS inspection", "compromised prompt/model path", "exfiltrate personal data",
+                     "not an egress boundary"):
+            self.assertIn(text, output)
+
+
 class AzurePolicyTests(unittest.TestCase):
     def setUp(self):
         self.config = config()
@@ -155,6 +257,7 @@ class AzurePolicyTests(unittest.TestCase):
         self.assertEqual(payload["volumes"], [{"volumeName": "hermes-data", "mountpoint": "/mnt/data", "readOnly": False}])
         self.assertEqual(payload["environment"], {"AZURE_TOKEN_CREDENTIALS": "ManagedIdentityCredential"})
         self.assertEqual(payload["entrypoint"], ["/usr/bin/tini", "-s", "--", "/usr/local/bin/hermes-entrypoint"])
+        self.assertEqual(payload["egressPolicy"], {"defaultAction": "Allow", "trafficInspection": "None"})
         self.assertNotIn("ports", payload)
 
     def test_raw_suspend_readback_required(self):
@@ -205,53 +308,339 @@ class AzurePolicyTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 common.validate_ports({"ports": [port]}, self.config, self.identifier)
 
-    def test_egress_deny_default_partial_and_exact_hosts(self):
-        self.assertEqual(self.egress["defaultAction"], "Deny")
-        self.assertEqual(self.egress["trafficInspection"], "Partial")
-        self.assertNotIn("rules", self.egress)
-        hosts = {row["pattern"] for row in self.egress["hostRules"]}
-        self.assertTrue(set(common.GOOGLE_HOSTS) <= hosts)
-        self.assertNotIn("accounts.google.com", hosts)
+    def test_none_allow_is_exact_and_reserved_hosts_do_not_create_rules(self):
+        self.assertEqual(self.egress, {"defaultAction": "Allow", "trafficInspection": "None"})
+        self.assertEqual(common.deployment_egress(config(identity_host="", whatsapp_hosts=())), self.egress)
+        self.assertEqual(common.deployment_egress(config(
+            identity_host="different.invalid", whatsapp_hosts=("different.whatsapp.invalid",),
+        )), self.egress)
+        self.assertNotIn("egress_mode", common.runtime_document(self.config))
         for host in ("*.google.com", "https://google.com", "host:443", "bad..host", "HOST.com"):
             with self.subTest(host=host), self.assertRaises(ValueError):
-                common.egress_document([host])
-        for inspection in ("Full", "None", "Legacy", None):
+                common.exact_host(host)
+
+    def test_readback_never_accepts_another_inspection_mode_default_or_active_rule(self):
+        for inspection in ("Full", "Partial", "Legacy", None, False, ""):
             changed = dict(self.egress, trafficInspection=inspection)
             with self.subTest(inspection=inspection), self.assertRaises(RuntimeError):
                 common.validate_egress({"egressPolicy": changed}, self.egress)
+        for changed in (
+            {}, None, [], {"defaultAction": "Allow"},
+            dict(self.egress, defaultAction="Deny"), dict(self.egress, defaultAction=None),
+            dict(self.egress, hostRules=[{"pattern": "example.com", "action": "Allow"}]),
+            dict(self.egress, rules=[{"action": {"type": "Transform", "headers": [{"value": "CANARY"}]}}]),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(RuntimeError) as raised:
+                common.validate_egress({"egressPolicy": changed}, self.egress)
+            self.assertNotIn("CANARY", str(raised.exception))
 
-    def test_missing_verified_egress_inputs_block_deployment(self):
-        for changes in ({"identity_host": ""}, {"whatsapp_hosts": ()}):
-            with self.subTest(changes=changes), self.assertRaises(ValueError):
-                common.deployment_egress(config(**changes))
+    def test_known_readback_enums_are_normalized_without_treating_null_as_none(self):
+        class Inspection(str, Enum):
+            NONE = "None"
 
-    def test_dns_or_timeout_alone_is_not_network_deny_proof(self):
+        class Action(str, Enum):
+            ALLOW = "Allow"
+
+        for action, inspection in (("allow", "none"), ("ALLOW", "NONE"), (Action.ALLOW, Inspection.NONE)):
+            with self.subTest(action=action, inspection=inspection):
+                result = common.validate_egress({
+                    "egressPolicy": {"defaultAction": action, "trafficInspection": inspection},
+                }, self.egress)
+                self.assertTrue(result["known_fields_match"])
+        for value in (None, False, 0, "", "no-inspection", " None "):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                common.validate_egress({"egressPolicy": dict(self.egress, trafficInspection=value)}, self.egress)
+
+    def test_only_known_empty_optional_rule_lists_can_be_normalized_on_readback(self):
+        for value in (None, []):
+            common.validate_egress({"egressPolicy": dict(self.egress, hostRules=value, rules=value)}, self.egress)
+        common.validate_egress({"egressPolicy": self.egress}, self.egress)
+        for name in ("hostRules", "rules"):
+            for value in ("", {}, False, True, 0, "CANARY", None, []):
+                if value is None or value == []:
+                    continue
+                with self.subTest(name=name, value=value), self.assertRaises(RuntimeError):
+                    common.validate_egress({"egressPolicy": {**self.egress, name: value}}, self.egress)
+
+    def test_benign_unknown_metadata_is_tolerated_but_names_and_no_assurance_are_reported(self):
+        for value in (None, [], {}, False, 0, "VALUE_CANARY", {"nested": "VALUE_CANARY"}):
+            policy = {**self.egress, "metadata": value, "reportedAt": value, "apiVersion": value}
+            with self.subTest(value=value), self.assertLogs("hermes.egress", level="WARNING") as captured:
+                result = common.validate_egress({"egressPolicy": policy}, self.egress)
+            self.assertEqual(result["unknown_field_names"], ["apiVersion", "metadata", "reportedAt"])
+            self.assertEqual(result["unknown_field_count"], 3)
+            self.assertEqual(result["unknown_field_semantics"], "NOT RELIED ON")
+            self.assertEqual(result["unrestricted_connectivity"], "NOT VERIFIED")
+            output = "\n".join(captured.output)
+            self.assertIn('["apiVersion", "metadata", "reportedAt"]', output)
+            self.assertIn("count=3", output)
+            self.assertIn("semantics are not relied on", output)
+            self.assertIn("not proof of unrestricted connectivity", output)
+            self.assertNotIn("VALUE_CANARY", output + json.dumps(result))
+            self.assertNotIn("nested", output + json.dumps(result))
+
+    def test_suspicious_policy_field_names_fail_even_if_empty_with_no_value_disclosure(self):
+        names = (
+            "futureRules", "hostMetadata", "actionOverride", "inspectionStatus", "denyAll", "allowedOrigins",
+            "destinationSet", "endpointMap", "networkIsolation", "egressDisabled", "proxyUrl", "TLSSettings",
+            "certificateBundle", "securityOptions", "trustStore", "policyVersion", "caBundle", "CASettings",
+            "portOverrides", "staticIP", "accessControl", "secretRef", "managedIdentityToken", "headers",
+            "managedIdentity", "transportConfig", "enforcementMode", "certBundle",
+        )
+        for name in names:
+            for value in (None, [], "VALUE_CANARY", {"Authorization": "VALUE_CANARY"}):
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(
+                    RuntimeError, "policy/security-bearing",
+                ) as raised:
+                    common.validate_egress({"egressPolicy": {**self.egress, name: value}}, self.egress)
+                self.assertIn(name, str(raised.exception))
+                self.assertIn("count=1", str(raised.exception))
+                self.assertNotIn("VALUE_CANARY", str(raised.exception))
+                self.assertNotIn("Authorization", str(raised.exception))
+
+    def test_security_acronym_plurals_and_synonyms_fail_name_only_without_logging_values(self):
+        names = (
+            "rootCAs", "ACLs", "sourceIPs", "SNIs", "CERTs", "PORTs", "SSLs",
+            "sourceIps", "blockedIps", "customCas", "customAcls", "customSnis",
+            "routes", "decryption", "decryptionMode", "interception", "auth", "authMode", "oauth",
+            "apiKey", "apiKeys", "password", "passwd", "sas", "URLs", "url",
+            "bypass", "overrides", "exemptions", "exceptions", "exclusions", "excluded",
+            "upstream", "gateway", "tunnel", "forwarding", "domain", "fqdn", "patterns", "api.example.net",
+        )
+        for name in names:
+            for value in (None, {"Authorization": "VALUE_CANARY"}):
+                with self.subTest(name=name, value=value):
+                    with self.assertNoLogs("hermes.egress", level="WARNING"), self.assertRaisesRegex(
+                        RuntimeError, "policy/security-bearing",
+                    ) as raised:
+                        common.validate_egress({"egressPolicy": {**self.egress, name: value}}, self.egress)
+                    self.assertIn(name, str(raised.exception))
+                    self.assertIn("count=1", str(raised.exception))
+                    self.assertNotIn("VALUE_CANARY", str(raised.exception))
+                    self.assertNotIn("Authorization", str(raised.exception))
+
+    def test_acronym_plurals_do_not_lose_existing_short_word_boundaries(self):
+        names = (
+            "rootCAId", "ACLId", "sourceIPId", "CERTId", "CAId",
+            "IPId", "SNIId", "PORTId", "SSLOn", "SSLIs",
+        )
+        for name in names:
+            for value in (None, {"Authorization": "VALUE_CANARY"}):
+                with self.subTest(name=name, value=value):
+                    with self.assertNoLogs("hermes.egress", level="WARNING"), self.assertRaisesRegex(
+                        RuntimeError, "policy/security-bearing",
+                    ) as raised:
+                        common.validate_egress({"egressPolicy": {**self.egress, name: value}}, self.egress)
+                    self.assertIn(name, str(raised.exception))
+                    self.assertIn("count=1", str(raised.exception))
+                    self.assertNotIn("VALUE_CANARY", str(raised.exception))
+                    self.assertNotIn("Authorization", str(raised.exception))
+
+    def test_benign_metadata_and_substring_traps_are_not_security_fields(self):
+        names = (
+            "metadata", "apiVersion", "reportedAt", "provisioningState", "createdAt", "updatedAt",
+            "etag", "@odata.etag", "@odata.type", "resourceId", "id", "IDs", "APIs", "name", "kind", "type",
+            "status", "state", "region", "location", "description", "version", "generation",
+            "annotations", "labels", "monkey", "monkeys", "author", "authors", "portal", "portable",
+            "caching", "documentation", "opaqueId", "diagnostics", "revision", "hash",
+        )
+        policy = {**self.egress, **{name: {"nested": "VALUE_CANARY"} for name in names}}
+        with self.assertLogs("hermes.egress", level="WARNING") as captured:
+            result = common.validate_egress({"egressPolicy": policy}, self.egress)
+        self.assertEqual(result["unknown_field_names"], sorted(names))
+        self.assertEqual(result["unknown_field_count"], len(names))
+        self.assertEqual(result["unknown_field_semantics"], "NOT RELIED ON")
+        self.assertEqual(result["unrestricted_connectivity"], "NOT VERIFIED")
+        self.assertNotIn("VALUE_CANARY", "\n".join(captured.output) + json.dumps(result))
+        self.assertNotIn("nested", "\n".join(captured.output) + json.dumps(result))
+
+    def test_unsafe_or_oversized_field_names_are_not_echoed(self):
+        for name in ("https://VALUE_CANARY.invalid/?token=VALUE_CANARY", "VALUE_CANARY\n", "x" * 129, 1):
+            with self.subTest(kind=type(name).__name__), self.assertRaisesRegex(
+                RuntimeError, "safe name-only",
+            ) as raised:
+                common.validate_egress({"egressPolicy": {**self.egress, name: "VALUE_CANARY"}}, self.egress)
+            self.assertNotIn("VALUE_CANARY", str(raised.exception))
+        with self.assertRaisesRegex(RuntimeError, "safe name-only"):
+            common.validate_egress({"egressPolicy": {
+                **self.egress, **{f"metadata_{index}": None for index in range(65)},
+            }}, self.egress)
+
+    def test_request_shape_cannot_smuggle_rules_even_empty_or_bypass_opt_in(self):
+        for policy in (
+            dict(self.egress, hostRules=[]), dict(self.egress, rules=None),
+            dict(self.egress, unknown=False), dict(self.egress, trafficInspection="Partial"),
+        ):
+            with self.subTest(policy=policy), self.assertRaises(ValueError):
+                common.sandbox_document(self.config, disk_id="image-id", egress=policy)
+            with self.assertRaises(RuntimeError):
+                common.validate_egress({"egressPolicy": policy}, policy)
+        with self.assertRaises(RuntimeError):
+            common.sandbox_document(config(egress_mode=""), disk_id="image-id", egress=self.egress)
+
+    def test_missing_mode_prevents_egress_mutation(self):
+        for mode in ("", "hardened-unverified", "typo"):
+            sandbox = MagicMock()
+            with self.subTest(mode=mode), self.assertRaises(RuntimeError):
+                common.configure_egress(sandbox, config(egress_mode=mode))
+            self.assertEqual(sandbox.mock_calls, [])
+
+    def test_service_error_never_retries_a_policy_with_different_inspection(self):
+        sandbox = MagicMock()
+        sandbox._sbx_path = "/test/sandbox"
+        error = HttpResponseError("PRIVATE-SERVICE-DETAIL")
+        sandbox._dp_post.side_effect = error
+        with self.assertLogs("hermes.egress", level="WARNING"), self.assertRaises(HttpResponseError) as raised:
+            common.configure_egress(sandbox, self.config)
+        self.assertIs(raised.exception, error)
+        sandbox._dp_post.assert_called_once_with("/test/sandbox/egresspolicy", self.egress)
+        sandbox._dp_get.assert_not_called()
+
+    def test_configure_egress_rejects_unclassified_security_fields_without_retry(self):
+        sandbox = MagicMock(sandbox_id="sandbox-id", _sbx_path="/test/sandbox")
+        sandbox._dp_get.return_value = {"id": "sandbox-id", "egressPolicy": dict(self.egress, networkMetadata=None)}
+        with self.assertLogs("hermes.egress", level="WARNING"), self.assertRaisesRegex(RuntimeError, "networkMetadata"):
+            common.configure_egress(sandbox, self.config)
+        sandbox._dp_post.assert_called_once_with("/test/sandbox/egresspolicy", self.egress)
+        sandbox._dp_get.assert_called_once_with("/test/sandbox")
+
+    def test_network_error_is_not_success_and_does_not_change_policy_or_trust(self):
         sandbox = MagicMock()
         raw = {"egressPolicy": self.egress}
-        allowed = {
-            host: {"public_ca_tls": True, "http_status": 404}
-            for host in ("personal.services.ai.azure.com", *common.GOOGLE_HOSTS, "web.whatsapp.com")
-        }
-        evidence = {**allowed, "example.com": {"network_error": "URLError"}}
-        sandbox._dp_post.return_value = {"exitCode": 0, "stdout": json.dumps(evidence)}
-        sandbox._dp_get.return_value = {"networkEgress": {"denied": []}}
-        with patch.object(common, "raw_sandbox", return_value=raw), patch.object(common.time, "monotonic", side_effect=[0, 31]):
-            with self.assertRaisesRegex(RuntimeError, "no platform deny"):
-                common.verify_partial_network(sandbox, self.config)
+        for evidence in (
+            {"example.com": {"network_error": "URLError"}},
+            {"example.com": {"public_ca_tls": False, "http_status": 200}},
+            {"example.com": {"public_ca_tls": True, "http_status": True}},
+            {"example.com": {"public_ca_tls": True, "http_status": 200, "secret": "CANARY"}},
+            {},
+        ):
+            sandbox.reset_mock()
+            sandbox._dp_post.return_value = {"exitCode": 0, "stdout": json.dumps(evidence)}
+            with patch.object(common, "raw_sandbox", return_value=raw):
+                with self.subTest(evidence=evidence), self.assertRaisesRegex(RuntimeError, "public-CA") as raised:
+                    common.verify_mvp_network(sandbox, self.config)
+            self.assertNotIn("CANARY", str(raised.exception))
+            self.assertEqual(sandbox._dp_post.call_count, 1)
+            self.assertTrue(sandbox._dp_post.call_args.args[0].endswith("/executeShellCommand"))
+            sandbox._dp_put.assert_not_called()
 
-    def test_verified_public_tls_and_platform_deny_are_required_together(self):
+    def test_mvp_network_checks_only_nonpersonal_https_without_a_deny_or_isolation_claim(self):
         sandbox = MagicMock()
-        allowed = {
-            host: {"public_ca_tls": True, "http_status": 404}
-            for host in ("personal.services.ai.azure.com", *common.GOOGLE_HOSTS, "web.whatsapp.com")
-        }
+        sandbox._sbx_path = "/test/sandbox"
         sandbox._dp_post.return_value = {
-            "exitCode": 0, "stdout": json.dumps({**allowed, "example.com": {"network_error": "URLError"}}),
+            "exitCode": 0, "stdout": json.dumps({"example.com": {"public_ca_tls": True, "http_status": 404}}),
         }
-        sandbox._dp_get.return_value = {"networkEgress": {"denied": [{"host": "example.com"}]}}
         with patch.object(common, "raw_sandbox", return_value={"egressPolicy": self.egress}):
-            result = common.verify_partial_network(sandbox, self.config)
-        self.assertTrue(result["platform_deny_observed"])
+            result = common.verify_mvp_network(sandbox, self.config)
+        self.assertFalse(result["outbound_isolation"])
+        self.assertFalse(result["all_destinations_tested"])
+        self.assertEqual(result["traffic_inspection"], "None")
+        self.assertEqual(result["public_ca_tls_hosts"], ["example.com"])
+        self.assertNotIn("platform_deny_observed", result)
+        sandbox._dp_get.assert_not_called()
+        command = shlex.split(sandbox._dp_post.call_args.args[1]["command"])
+        self.assertEqual(json.loads(command[-1]), ["example.com"])
+        self.assertIn("ssl.create_default_context", command[-2])
+        self.assertIn("ProxyHandler({})", command[-2])
+        self.assertNotIn("_create_unverified_context", command[-2])
+
+    def test_network_mode_or_raw_policy_failure_precedes_guest_execution(self):
+        sandbox = MagicMock()
+        with self.assertRaises(RuntimeError):
+            common.verify_mvp_network(sandbox, config(egress_mode="hardened-unverified"))
+        self.assertEqual(sandbox.mock_calls, [])
+        with patch.object(common, "raw_sandbox", return_value={
+            "egressPolicy": dict(self.egress, trafficInspection="Full"),
+        }), self.assertRaises(RuntimeError):
+            common.verify_mvp_network(sandbox, self.config)
+        sandbox._dp_post.assert_not_called()
+
+
+class EgressStatusAndAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.config = config()
+        self.clients = MagicMock()
+        self.sandbox = MagicMock(sandbox_id="sandbox-id")
+        self.raw = {
+            "id": "sandbox-id", "state": "Running",
+            "lifecycle": {"autoSuspendPolicy": {"enabled": False}},
+            "ports": [common.port_document(self.config, "sandbox-id")],
+            "egressPolicy": common.deployment_egress(self.config),
+        }
+        self.status = {
+            "schema_version": 1, "dashboard": "running", "gateway": "not-paired",
+            "whatsapp": "not-paired", "google": "disabled", "disk_free_bytes": common.MIN_FREE_BYTES,
+        }
+
+    def test_status_has_unrestricted_warning_and_no_false_hardened_or_live_success(self):
+        self.raw["egressPolicy"].update({"metadata": {"private": "VALUE_CANARY"}, "provisioningState": "VALUE_CANARY"})
+        with (
+            patch.object(test_hermes, "assert_owner"),
+            patch.object(test_hermes, "owned_inventory", return_value=([], [], [object()])),
+            patch.object(test_hermes, "get_sandbox", return_value=self.sandbox),
+            patch.object(test_hermes, "raw_sandbox", return_value=self.raw),
+            patch.object(test_hermes, "read_runtime", return_value=common.runtime_document(self.config)),
+            patch.object(test_hermes, "read_access_key"),
+            patch.object(test_hermes, "control_status", return_value=self.status),
+            patch.object(test_hermes, "verify_mvp_network") as network,
+            self.assertLogs("hermes.egress", level="WARNING") as logged,
+        ):
+            result = test_hermes.inspect_deployment(self.config, self.clients)
+            self.assertEqual(result["network"], "NOT VERIFIED")
+            network.assert_not_called()
+            network.return_value = {"outbound_isolation": False}
+            checked = test_hermes.inspect_deployment(self.config, self.clients, network=True)
+        network.assert_called_once_with(self.sandbox, self.config)
+        self.assertEqual(checked["network"], {"outbound_isolation": False})
+        self.assertEqual(result["egress"]["mode"], "allow-all-mvp")
+        self.assertEqual(result["egress"]["trafficInspection"], "None")
+        self.assertEqual(result["egress"]["defaultAction"], "Allow")
+        self.assertFalse(result["egress"]["outbound_isolation"])
+        self.assertEqual(result["raw_azure_policy"], "KNOWN MVP FIELDS MATCH")
+        self.assertEqual(result["egress"]["readback"]["unknown_field_names"], ["metadata", "provisioningState"])
+        self.assertEqual(result["egress"]["readback"]["unknown_field_count"], 2)
+        self.assertEqual(result["egress"]["readback"]["unrestricted_connectivity"], "NOT VERIFIED")
+        self.assertIn("exfiltrate personal data", result["egress"]["warning"])
+        self.assertIn("NO outbound network isolation", "\n".join(logged.output))
+        self.assertNotIn("VALUE_CANARY", json.dumps(result) + "\n".join(logged.output))
+        for key in ("foundry_inference", "whatsapp_delivery", "google_live_read", "entra_non_owner_and_websocket"):
+            self.assertEqual(result[key], "NOT VERIFIED")
+        self.assertNotIn("egress", result["runtime"])
+        self.assertNotIn("partial_network", result)
+
+    def test_access_warns_and_checks_policy_before_starting_the_fixed_loopback_relay(self):
+        self.raw["egressPolicy"]["metadata"] = {"private": "VALUE_CANARY"}
+        for valid in (False, True):
+            raw = self.raw if valid else {**self.raw, "egressPolicy": {
+                "defaultAction": "Allow", "trafficInspection": "Full",
+            }}
+            with (
+                self.subTest(valid=valid),
+                patch.object(access_hermes, "load_egress_config", return_value=self.config),
+                patch.object(common.AzureClients, "create") as azure,
+                patch.object(access_hermes, "assert_owner"),
+                patch.object(access_hermes, "get_sandbox", return_value=self.sandbox),
+                patch.object(access_hermes, "raw_sandbox", return_value=raw),
+                patch.object(access_hermes, "Proxy") as proxy,
+                patch.object(access_hermes.web, "run_app") as run,
+                patch.object(sys, "argv", ["script"]),
+                self.assertLogs("hermes.egress", level="WARNING") as logged,
+                redirect_stdout(io.StringIO()),
+            ):
+                if valid:
+                    access_hermes.main()
+                    self.assertEqual(proxy.call_args.kwargs["target"], common.ingress_url("sandbox-id", "swedencentral"))
+                    self.assertEqual(proxy.call_args.kwargs["local_origin"], "http://127.0.0.1:8765")
+                    run.assert_called_once_with(
+                        proxy.return_value.app, host="127.0.0.1", port=8765, access_log=None, print=None,
+                    )
+                else:
+                    with self.assertRaises(RuntimeError):
+                        access_hermes.main()
+                    proxy.assert_not_called()
+                    run.assert_not_called()
+                azure.assert_called_once_with(self.config)
+                self.assertNotIn("VALUE_CANARY", "\n".join(logged.output))
 
 
 class PrivateUploadTests(unittest.TestCase):
@@ -450,12 +839,10 @@ class DeploymentRollbackTests(unittest.TestCase):
         deletion.result.side_effect = lambda **kwargs: setattr(self, "image_deleted", True)
         deletion.done.return_value = True
         replacements = {
-            # This unit fixture tests the otherwise-blocked transaction only;
-            # there is deliberately no production flag that bypasses the gate.
-            "assert_deployment_supported": None, "assert_owner": None, "provision_group": None,
+            "assert_owner": None, "provision_group": None,
             "owned_inventory": ([], [], []), "create_image": "new-image", "wait_image": None, "wait_running": self.raw,
             "upload_private_file": None, "read_runtime": common.runtime_document(self.config),
-            "verify_partial_network": None, "control_status": {"dashboard": "running"},
+            "verify_mvp_network": None, "control_status": {"dashboard": "running"},
             "configure_port": "https://new-sandbox--8080.swedencentral.adcproxy.io",
         }
         self.mocks = {}
@@ -483,6 +870,38 @@ class DeploymentRollbackTests(unittest.TestCase):
             deploy_hermes.deploy(self.config, self.clients)
         self.assertIs(captured.exception, error)
         self.assert_rolled_back_without_data_deletion()
+
+    def test_create_service_error_never_retries_or_changes_none_allow_policy(self):
+        error = HttpResponseError("PRIVATE-CREATE-DETAIL")
+        self.clients.group._dp_put.side_effect = error
+        with self.assertLogs("hermes.deploy", level="ERROR"), self.assertRaises(HttpResponseError) as raised:
+            deploy_hermes.deploy(self.config, self.clients)
+        self.assertIs(raised.exception, error)
+        self.clients.group._dp_put.assert_called_once()
+        self.assertEqual(
+            self.clients.group._dp_put.call_args.args[1]["egressPolicy"],
+            {"trafficInspection": "None", "defaultAction": "Allow"},
+        )
+        self.sandbox._dp_post.assert_not_called()
+        self.mocks["configure_port"].assert_not_called()
+
+    def test_policy_readback_mismatch_rolls_back_without_exposure_or_policy_retry(self):
+        for policy in (
+            dict(common.deployment_egress(self.config), trafficInspection="Partial"),
+            dict(common.deployment_egress(self.config), trafficInspection="Full"),
+            dict(common.deployment_egress(self.config), futureRules=None),
+        ):
+            with self.subTest(policy=policy):
+                self.deleted = False
+                self.image_deleted = False
+                self.mocks["wait_running"].return_value = {**self.raw, "egressPolicy": policy}
+                with self.assertRaisesRegex(RuntimeError, "raw egress policy|policy/security-bearing"):
+                    deploy_hermes.deploy(self.config, self.clients)
+        self.assertEqual(self.clients.group._dp_put.call_count, 3)
+        self.sandbox._dp_post.assert_not_called()
+        self.mocks["configure_port"].assert_not_called()
+        self.mocks["upload_private_file"].assert_not_called()
+        self.clients.group.begin_delete_volume.assert_not_called()
 
     def test_unexpected_status_shape_rolls_back(self):
         self.mocks["control_status"].return_value = {}
@@ -630,7 +1049,6 @@ class OrderedDeploymentTests(unittest.TestCase):
         self.addCleanup(output_context.__exit__, None, None, None)
 
         replacements = {
-            "assert_deployment_supported": lambda: None,
             "assert_owner": lambda *args: None,
             "provision_group": lambda *args: None,
             "owned_inventory": lambda *args: (
@@ -640,7 +1058,7 @@ class OrderedDeploymentTests(unittest.TestCase):
             "wait_running": lambda sandbox: sandbox._dp_get(sandbox._sbx_path),
             "upload_private_file": lambda *args, **kwargs: self.events.append("upload-runtime"),
             "read_runtime": lambda *args: common.runtime_document(self.config),
-            "verify_partial_network": lambda *args: None,
+            "verify_mvp_network": lambda *args: None,
             "configure_port": lambda *args: self.events.append("open-port"),
         }
         self.mocks = {}
@@ -1220,7 +1638,7 @@ class OrderedDeploymentTests(unittest.TestCase):
         self.assertLess(self.events.index("upload-runtime"), self.events.index("open-port"))
 
     def test_failed_replacement_preserves_previous_image_and_rolls_back_new_resources(self):
-        self.mocks["verify_partial_network"].side_effect = RuntimeError("fixture egress mismatch")
+        self.mocks["verify_mvp_network"].side_effect = RuntimeError("fixture egress mismatch")
         with self.assertRaisesRegex(RuntimeError, "fixture egress mismatch"):
             deploy_hermes.deploy(self.config, self.clients, replace=True)
         self.assertIn("old-image", self.images)
@@ -1257,6 +1675,46 @@ class OrderedDeploymentTests(unittest.TestCase):
         self.assertEqual(deploy_hermes.deploy(self.config, self.clients), "old-sandbox")
         self.assertEqual(self.events, ["get:old-sandbox", "status:old-sandbox"])
         self.mocks["create_image"].assert_not_called()
+
+    def test_existing_policy_mismatch_is_not_adopted_or_rewritten(self):
+        self.images["old-image"].image.base = self.config.image
+        original_get = self.old._dp_get.side_effect
+
+        def mismatched(path):
+            raw = original_get(path)
+            raw["egressPolicy"] = {"trafficInspection": "Full", "defaultAction": "Deny"}
+            return raw
+
+        self.old._dp_get.side_effect = mismatched
+        with self.assertRaisesRegex(RuntimeError, "raw egress policy"):
+            deploy_hermes.deploy(self.config, self.clients)
+        self.assertEqual(self.events, ["get:old-sandbox"])
+        self.mocks["create_image"].assert_not_called()
+        self.clients.group._dp_put.assert_not_called()
+        self.old._dp_post.assert_not_called()
+        self.old.begin_delete.assert_not_called()
+
+    def test_existing_mvp_benign_metadata_does_not_trigger_replacement_or_policy_mutation(self):
+        self.images["old-image"].image.base = self.config.image
+        original_get = self.old._dp_get.side_effect
+
+        def metadata(path):
+            raw = original_get(path)
+            raw["egressPolicy"]["metadata"] = {"private": "VALUE_CANARY"}
+            return raw
+
+        self.old._dp_get.side_effect = metadata
+        with self.assertLogs("hermes.egress", level="WARNING") as captured:
+            self.assertEqual(deploy_hermes.deploy(self.config, self.clients), "old-sandbox")
+        self.assertIn('["metadata"]', "\n".join(captured.output))
+        self.assertNotIn("VALUE_CANARY", "\n".join(captured.output) + self.output.getvalue())
+        self.assertEqual(self.events, ["get:old-sandbox", "status:old-sandbox"])
+        self.mocks["create_image"].assert_not_called()
+        self.clients.group._dp_put.assert_not_called()
+        self.old._dp_post.assert_called_once_with(
+            "/test/old-sandbox/executeShellCommand", {"command": shlex.join([*common.CONTROL, "status", "--json"])},
+        )
+        self.old.begin_delete.assert_not_called()
 
     def test_unchanged_but_unready_dashboard_never_reports_ready(self):
         self.images["old-image"].image.base = self.config.image
@@ -1498,17 +1956,19 @@ class CleanupTests(unittest.TestCase):
 
     def test_known_unsupported_policy_stops_before_any_azure_operation(self):
         with patch.object(deploy_hermes, "provision_group") as provision, self.assertRaisesRegex(
-            RuntimeError, "Partial .* defaultAction Deny",
+            RuntimeError, "Partial \\+ Deny was rejected",
         ):
-            deploy_hermes.deploy(config(image=""), self.clients)
+            deploy_hermes.deploy(config(image="", egress_mode="hardened-unverified"), self.clients)
         provision.assert_not_called()
         self.assertEqual(self.clients.method_calls, [])
 
     def test_production_cli_blocks_before_configuration_and_azure_clients(self):
         with patch("sys.argv", ["deploy_hermes.py"]), patch.object(
-            common.Config, "from_env",
-        ) as read_configuration, patch.object(common.AzureClients, "create") as create_clients:
-            with self.assertRaisesRegex(RuntimeError, "before Azure changes"):
+            common, "_read_env", return_value={"HERMES_EGRESS_MODE": "hardened-unverified"},
+        ), patch.object(common.Config, "from_values") as read_configuration, patch.object(
+            common.AzureClients, "create",
+        ) as create_clients:
+            with self.assertRaisesRegex(RuntimeError, "not deployable"):
                 deploy_hermes.main()
         read_configuration.assert_not_called()
         create_clients.assert_not_called()

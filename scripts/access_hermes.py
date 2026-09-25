@@ -14,8 +14,9 @@ from aiohttp import web
 from azure.core.exceptions import AzureError
 
 from hermes_common import (
-    AzureClients, Config, INGRESS_SCOPE, ROOT, assert_no_suspend, assert_owner,
-    get_sandbox, raw_sandbox, read_access_key, validate_ports,
+    AzureClients, INGRESS_SCOPE, ROOT, assert_no_suspend, assert_owner,
+    deployment_egress, get_sandbox, load_egress_config, raw_sandbox, read_access_key,
+    validate_egress, validate_ports, warn_unrestricted_egress,
 )
 
 sys.path.insert(0, str(ROOT / "hermes/image"))
@@ -55,12 +56,14 @@ def main() -> None:
     if not 1024 <= args.port <= 65535:
         parser.error("--port must be between 1024 and 65535.")
     logging.basicConfig(level=logging.INFO, format="%(name)s %(message)s")
-    config = Config.from_env(args.env_file)
+    config = load_egress_config(args.env_file)
+    warn_unrestricted_egress(config.egress_mode)
     with AzureClients.create(config) as clients:
         assert_owner(clients.credential, config)
         sandbox = get_sandbox(config, clients)
         raw = raw_sandbox(sandbox)
         assert_no_suspend(raw)
+        validate_egress(raw, deployment_egress(config))
         if str(raw.get("state", "")).lower() != "running":
             raise RuntimeError("Hermes is not running; automatic disk-mode resume is not supported.")
         target = validate_ports(raw, config, sandbox.sandbox_id)

@@ -1,14 +1,18 @@
 # Implementační plán: osobní Hermes v ACA Sandbox
 
 Stav: plán schválen Opus 5.5 po třetím review (9,5/10); lokální
-implementace následně přijata s hodnocením A 9,60/10 a B/C 10/10.
+implementace následně přijata s hodnocením A 9,60/10, B7 10/10
+a C 10/10. Dočasná B8 změna pro MVP egress byla samostatně přijata
+v review 9,2 -> 9,9/10 a přesný finální zdroj ještě v neskórovaném
+uzavření bez blockerů.
 U A nezůstávají opravitelné nálezy; zbývající odpočet je za přiznanou
 strukturální složitost, nikoli neopravené vady. Přesné lokální image
 a jejich integrační brány prošly. Všech 50 implementačních souborů bylo
 předáno do hlavního checkoutu a znovu ověřeno včetně celé hostitelské sady.
-Živé nasazení je nadále BLOCKED. Souhlasy a výsledky izolovaných pokusů
-jsou v §11; další pokus ani publikace nejsou automaticky povolené.
-Datum: 2026-09-24.
+Živé nasazení je nadále BLOCKED na samostatném cloudovém schválení
+a chybějících vstupech. Souhlasy a výsledky izolovaných pokusů jsou
+v §11; další pokus ani publikace nejsou automaticky povolené.
+Datum: 2026-09-25.
 
 ## 1. Cíl, rozsah a potvrzená rozhodnutí
 
@@ -27,6 +31,7 @@ způsoby startu tmux zůstanou funkčně beze změny.
 | LLM | Existující inference endpoint a model deployment ve Foundry dodá uživatel. Hermes používá nativní provider `azure-foundry`, autentizaci `entra_id` a Managed Identity Sandbox Group. |
 | Google | Konektory provozuje Hermes, ne Foundry. Osobní Google OAuth, pouze čtení/vyhledávání Gmailu a událostí. Žádné odesílání, změny událostí ani širší Workspace oprávnění. |
 | Persistentní tajemství | Uživatel výslovně schválil uložení Google refresh tokenu a WhatsApp device keys na chráněném DataDisk; nikoli v image, Gitu, logu nebo běžném exportu. |
+| MVP egress | Uživatel po vysvětlení rizika výslovně zvolil dočasný režim bez inspekce a s povolením veškerého odchozího provozu. Musí být aktivován přesně `HERMES_EGRESS_MODE=allow-all-mvp`; nejde o fallback ani bezpečný cílový stav. |
 | Orchestrace | Nejdříve review plánu Opus 5.5; potom tři implementační podsession. Každá má implementátora a vlastního nezávislého kritika. |
 | Git a cloud | Bez automatických commitů, pushů, PR, publikace image, přihlašování osobních účtů nebo změn existující Foundry infrastruktury. Živé operace až s konkrétními vstupy a schváleným cílem. |
 
@@ -538,11 +543,30 @@ Zbytkové riziko: nedůvěryhodný obsah může ovlivnit lokální paměť nebo
 shrnutí; paměť lze prohlédnout/resetovat majitelem. Nemá rozšířit
 capabilities ani přesměrovat výstup do cizího chatu.
 
-Egress má výchozí `Deny`. Povolené cíle: konkrétní Foundry hostname,
-nezbytná Azure MI/token cesta, Google OAuth/Gmail/Calendar endpointy a
-konkrétní WhatsApp Web/media domény požadované připnutým bridge.
-Bez `*.azure.com`, `*.google.com`, `*.facebook.com` nebo globálního Allow.
-Instalace balíčků probíhá pouze při buildu.
+Dlouhodobý bezpečný cíl zůstává `Deny` s konkrétními Foundry, Azure
+identity, Google a WhatsApp cíli. Tento kontrakt není živě prokázán.
+Uživatel proto pro aktuální MVP výslovně schválil **dočasnou bezpečnostní
+výjimku**: `trafficInspection=None`, `defaultAction=Allow`, bez host
+nebo advanced rules. To znamená, že runtime proces schopný síťové
+komunikace může kontaktovat libovolnou internetovou destinaci a při
+kompromitaci prompt/model cesty může dojít k exfiltraci dat.
+
+Výjimka se nikdy nezapne automaticky po chybě bezpečného režimu.
+Deploy, test a access vyžadují přesnou hodnotu
+`HERMES_EGRESS_MODE=allow-all-mvp`; prázdná, chybná, neznámá nebo
+`hardened-unverified` hodnota selže ještě před vytvořením konfigurace
+a Azure operací. Cleanup zůstává dostupný bez souhlasu s výjimkou.
+Odstranění lokální proměnné nezastaví již běžící sandbox; aktivní
+expozici ukončí odstranění vlastněného compute. Instalace balíčků
+probíhá pouze při buildu.
+
+Readback musí mít efektivně `Allow` a `None`; známá rule pole smějí být
+jen absent/null/prázdná. Benigní server metadata se vypíší pouze názvem
+a počtem bez hodnot a bez bezpečnostního tvrzení. Neznámé názvy
+naznačující policy, pravidla, destinace, proxy, TLS, autentizaci nebo
+credentials selžou fail closed. Smoke veřejné CA ani readback nejsou
+důkazem univerzální dosažitelnosti; skutečné klienty je nutné ověřit
+živě s normální kontrolou certifikátu a hostname.
 
 Traffic inspection (`Full`, `Partial`, `None`) je policy-wide, nikoli
 per-host. B jako první ověří podporu režimu `Partial` se skutečným
@@ -558,14 +582,16 @@ Node i Python/httplib2 a funkčním Baileys WS.
 Image import byl Ready; nejde o chybu image nebo RBAC. Původní kombinace
 je tedy BLOCKED. Oficiální dokumentace uvádí `Full + Deny` s host rules,
 ale neprokazuje přesný CA/proxy mechanismus, rotaci ani ochranu logů.
-`None` není doložená náhrada zachovávající hostname deny.
+`None` není doložená náhrada zachovávající hostname deny; v MVP se
+používá vědomě právě bez takového tvrzení.
 Full může změnit TLS hranici důvěry: inspekční služba může vidět tokeny,
 OAuth credentials a obsah. Platná TLS validace vůči inspektoru není
 totéž co původní end-to-end TLS. Osobní použití není automaticky schváleno.
 Test zahrne `oauth2.googleapis.com`, `gmail.googleapis.com`,
 `www.googleapis.com`, Foundry host, MI host a případné zjištění verze
 Baileys při startu. Media/download hosty se při vypnutých přílohách
-nepovolují plošně. Nedoložený allowlist je živý release blocker.
+nepovolují plošně. Nedoložený allowlist zůstává blockerem návratu k hardened režimu,
+nikoli dočasného explicitního MVP profilu.
 
 ## 8. Rozhraní mezi pracovními proudy
 
@@ -689,16 +715,16 @@ nahrazena pouze na explicitním testovacím injection pointu.
 | Brána | Konkrétní podmínka úspěchu |
 | --- | --- |
 | P0: review plánu | Nezávislý Opus 5.5 report, vyřešené zásadní připomínky, zaznamenané skóre a otevřené vstupy. Teprve potom implementace. |
-| P1: lokální kontrakty | Validace runtime/env, oddělení Copilot/Hermes, raw Entra ACL a suspend-disabled payload/readback, egress deny-default, žádný secret v plan/log outputs, správné failure exits. |
+| P1: lokální kontrakty | Validace runtime/env, oddělení Copilot/Hermes, raw Entra ACL a suspend-disabled payload/readback. MVP vyžaduje explicitní `allow-all-mvp`, přesné `None` + `Allow`, žádná známá pravidla, name-only diagnostiku a žádný fallback; hardened režim zůstává blocked. Žádný secret v plan/log outputs, správné failure exits. |
 | P2: image | Build `linux/amd64`; Hermes/Node/Python verze, web/TUI/stamp artefakty existují, smoke skutečného startu. Network-none test dokládá, že se nevolá npm/pip/uv a bridge běží z image, ne z DataDisk. |
 | P3: browser cesta | Offline všechny hopy uvnitř image: lokální proxy -> fake ingress ověřující bearer -> skutečný ingress proxy -> skutečný dashboard. HTML, Chat PTY/WS, streaming/session/reload, ping/reconnect fungují. Wrong key/Host/Origin/proxy target/forwarded headers/body/frame a zakázané management routy se odmítnou; žádný token v logu. |
 | P4: agent policy | Fake OpenAI-compatible endpoint zachytí skutečné model-visible `tools` z CLI, dashboard Chat/PTY a WhatsApp adapteru přes fake bridge. Exact equality s §7, také test neznámé platformy. Pokus o terminal/local HTTP/delegaci/skrytý tools upgrade selže před execution. |
 | P5: Google offline | Mock API/HTTP limity; přesná grant scope množina, jiný účet/narrow/broad grant, expirace/revokace, dva souběžné MCP procesy bez zápisu refresh tokenu, atomický onboarding upload, žádné write metody. Skutečné stdio ověří zotavení po dočasné startup chybě, explicitní trvalou nedostupnost bez čtení dat a sanitizaci neočekávaných chyb. |
 | P6: lifecycle/persistence | `maintenance`, `not-paired`, špatný paired účet, `loggedOut`, souběžný pair/start, CLI SIGUSR1 během pair, zakázaný dashboard restart, shutdown a crash loop bez druhého gateway. Managed drift se odmítne při každém startu. SQLite a WhatsApp identity přežijí skutečnou výměnu sandboxu nad DataDisk. |
-| P7: Azure auth živě | První spike: owner token+WS funguje; anonymní/wrong-audience a MI non-owner odmítnuty na ingressu. MI nejprve pozitivní kontrola s dočasným ACL, pak negativní bez ní. Raw readback + dočasný egress host + cleanup; skutečné hlavičky, SDK key read, raw idle i 10 minut WS s pingem. Poté inference/tool calling z dashboardu i WhatsAppu přes MI, chybné RBAC selže. |
+| P7: Azure auth živě | Nejprve exact raw `None` + `Allow` readback a šest skutečných klientských TLS/endpoint kontrol bez vypnutí certifikační validace. Potom owner token+WS; anonymní/wrong-audience a MI non-owner odmítnuty na ingressu. MI nejprve pozitivní kontrola s dočasným ACL, pak negativní bez ní; skutečné hlavičky, SDK key read, raw idle i 10 minut WS s pingem a cleanup. Poté inference/tool calling z dashboardu i WhatsAppu přes MI, chybné RBAC selže. |
 | P8: WhatsApp živě | QR skutečného owner účtu, nonce a dohledatelná odpověď ve self-chatu; restart během/po send a replay `append` netvoří smyčku. Reconnect bez nového párování; žádná odezva na skupinu/cizí DM, žádný outbound na cizí JID/LID. |
 | P9: Google živě | Po vlastním consentu dotaz z webu i self-chatu přečte uživatelem připravený neškodný testovací mail a událost. Účet a scope odpovídají; žádné odeslání ani změna dat. |
-| P10: regresní a provozní | Stávající jednotkové testy projdou; existující Copilot soubory/kontrakty nedotčené. Zakázaný egress skutečně odmítnut, kapacita disku vyhoví, dokumentován onboarding, obnova, revokace a cleanup. |
+| P10: regresní a provozní | Stávající jednotkové testy projdou; existující Copilot soubory/kontrakty nedotčené. Pro MVP jsou doloženy prominentní egress warningy, explicitní opt-in a ukončení expozice cleanupem; odmítnutí zakázaného egressu se znovu vyžaduje až před hardened release. Kapacita disku vyhoví, dokumentován onboarding, obnova, revokace a cleanup. |
 
 Offline test nesmí být prezentován jako test WhatsAppu nebo MI v Azure.
 Živé destruktivní/negativní scénáře běží pouze proti označené testovací
@@ -832,7 +858,7 @@ příslušných session.
 | Proud | Dosavadní skóre Opus 5.5 | Stav |
 | --- | --- | --- |
 | A: runtime a WhatsApp | 6,2 -> 7,8 -> 8,0; náhradní kritik 9,15 -> 9,60/10 | Finální A6 přijata bez opravitelných nálezů či vad důkazů. Opravené lifecycle/RPC, skutečný bridge, pre-tool `@reference` I/O a přísný dependency graph. Prošly přesné image, 121 nativních Python a 12 Node testů, skutečný entrypoint a browser scénáře. Zbývající odpočet je za strukturální patchování upstreamu, dvě schválené výjimky a zdokumentované provozní limity; není důvod vyrábět další nezměněná review nebo tvrdit 10/10. |
-| B: Azure a přístup | 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10 | B7 lokálně schválen bez otevřených nálezů. Přesné RPC a stateful replacement/cleanup/recovery zůstaly beze změny; následně znovu ověřena celá nová produkční/SDK/browser image a všech pět skutečných browser scénářů bez starého source overlay. Skóre není schválení živého Azure nasazení. |
+| B: Azure a přístup | B7: 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10; B8 MVP: 9,2 -> 9,9/10 + neskórované exact-source ACCEPT | B7 zůstává historicky schválený hardened základ. B8 mění pouze sedm host-side provisioning/docs/test souborů: vyžaduje explicitní `allow-all-mvp`, přesné `None` + `Allow`, žádná známá pravidla, canary-safe metadata diagnostiku a prominentní warning. Náhradní Opus 5.5 uzavřel F1/F2/F3/F1-R bez blockerů. Runtime/image/C/workflow/dependency bytes zůstaly identické; skóre není schválení živého Azure nasazení. |
 | C: Google read-only | 8,6 -> 9,8 -> 10/10; samostatná integrační revize C4 znovu 10/10 | Předaný C4 patch je nezávisle zreviewovaný, 104 lokálních testů prošlo. Nativní timing/cancellation a fake-bridge WhatsApp tools jsou další offline integrační důkazy. Osobní OAuth/P9/soak tím neprošly. |
 
 Žádný z těchto výsledků neodstraňuje blokaci produkčního deploye ani
@@ -849,21 +875,24 @@ lokální přijetí; živé/release hodnocení 5,5 zůstává neschválené.
 
 ## 13. Lokální předání
 
-Do hlavního checkoutu na `main` byl aplikován jediný sjednocený patch
-A6/B7/C4, SHA-256
+Do hlavního checkoutu na `main` byl nejprve aplikován jediný sjednocený
+patch A6/B7/C4, SHA-256
 `6303b30ed9d1b9f1b6140312b636150aac485051c6f8301591b37b77ed9377a6`.
+Následně byl aplikován pouze reviewovaný B8 delta patch pro MVP egress,
+SHA-256
+`44adce523afbcaed1e83b0f0173c6e79559dd4267e649066f87d2bb94dc435e6`.
 Všech 50 souborů včetně executable bitů odpovídá finálnímu manifestu;
 tento plán je samostatný doprovodný dokument. Původní Copilot implementace
 zůstala beze změny, kromě odkazu v README a dvou pravidel `.gitignore`.
 Nevznikl commit, push, PR ani publikace image.
 
-Opakovaný úplný běh z hlavního checkoutu: **390 testů, 323 prošlo,
-67 image-only přeskočeno**, 70,486 s. Zahrnuje sedm původních regresních
-testů. Přesná množina 67 přeskočených ID byla porovnána s finálním
-manifestem; každý má úspěšný záznam ze skutečné odpovídající image.
-Po testech byly znovu ověřeny všechny zdrojové hashe a módy. Cloudové
-hlášky v jednotkových testech pocházejí z mocků, nikoli nových zásahů
-do Azure.
+Finální B8 replay před předáním: B sada **184 celkem / 170 prošlo /
+14 image-only přeskočeno**, úplná host sada **416 / 349 / 67** a přesná
+existující SDK image **52 / 52 / 0**. Přesná množina 67 přeskočených ID
+i důvodů odpovídá A6 image-covered sadě. Runtime/image vstupy se
+nezměnily, proto se image znovu nestavěly. Po aplikaci do hlavního
+checkoutu se tyto brány opakují; cloudové hlášky v jednotkových testech
+pocházejí z mocků, nikoli nových zásahů do Azure.
 
 Provozní návod je v [hermes.md](hermes.md). Schválení lokálního kódu
 neodemyká produkční deploy: zbývá samostatně povolené živé ověření sítě,

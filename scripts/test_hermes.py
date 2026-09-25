@@ -10,13 +10,15 @@ from pathlib import Path
 from azure.core.exceptions import HttpResponseError
 
 from hermes_common import (
-    AzureClients, Config, assert_no_suspend, assert_owner, control_status, deployment_egress,
-    get_sandbox, owned_inventory, raw_sandbox, read_access_key, read_runtime, runtime_document,
-    validate_egress, validate_ports, verify_partial_network,
+    AzureClients, Config, MVP_EGRESS_WARNING, assert_no_suspend, assert_owner, control_status, deployment_egress,
+    get_sandbox, load_egress_config, owned_inventory, raw_sandbox, read_access_key, read_runtime, runtime_document,
+    validate_egress, validate_ports, verify_mvp_network, warn_unrestricted_egress,
 )
 
 
 def inspect_deployment(config: Config, clients: AzureClients, *, network: bool = False) -> dict:
+    egress = deployment_egress(config)
+    warn_unrestricted_egress(config.egress_mode)
     assert_owner(clients.credential, config)
     _, _, volumes = owned_inventory(config, clients)
     if len(volumes) != 1:
@@ -25,27 +27,34 @@ def inspect_deployment(config: Config, clients: AzureClients, *, network: bool =
     raw = raw_sandbox(sandbox)
     assert_no_suspend(raw)
     validate_ports(raw, config, sandbox.sandbox_id)
-    validate_egress(raw, deployment_egress(config))
+    readback = validate_egress(raw, egress)
     if read_runtime(sandbox) != runtime_document(config):
         raise RuntimeError("Actual runtime.json differs from the configured managed profile.")
     read_access_key(sandbox)
     status = control_status(sandbox)
     result = {
-        "schema_version": 1, "raw_azure_policy": "PASS", "runtime": status,
+        "schema_version": 1, "raw_azure_policy": "KNOWN MVP FIELDS MATCH", "runtime": status,
+        "egress": {
+            "mode": config.egress_mode, **egress,
+            "outbound_isolation": False, "warning": MVP_EGRESS_WARNING, "readback": readback,
+        },
         "foundry_inference": "NOT VERIFIED", "whatsapp_delivery": "NOT VERIFIED",
         "google_live_read": "NOT VERIFIED", "token_expiry_soak": "NOT VERIFIED",
         "entra_non_owner_and_websocket": "NOT VERIFIED",
     }
-    result["partial_network"] = verify_partial_network(sandbox, config) if network else "NOT VERIFIED"
+    result["network"] = verify_mvp_network(sandbox, config) if network else "NOT VERIFIED"
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--network", action="store_true", help="Probe exact hosts with public CA trust and check a platform deny.")
+    parser.add_argument(
+        "--network", action="store_true",
+        help="Check harmless public-CA HTTPS reachability; MVP mode has no outbound isolation or deny proof.",
+    )
     args = parser.parse_args()
-    config = Config.from_env(args.env_file)
+    config = load_egress_config(args.env_file)
     with AzureClients.create(config) as clients:
         result = inspect_deployment(config, clients, network=args.network)
     print(json.dumps(result, indent=2))

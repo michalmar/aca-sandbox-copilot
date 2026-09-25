@@ -5,30 +5,96 @@ This is a **separate, managed, text-only Hermes pilot** on
 Container App, Dynamic Session, or Foundry hosted agent. It does not replace
 or change this repository's Copilot deployment, image, scheduler, or `.env`.
 
-## Current deployment gate
+## Explicit temporary MVP egress opt-in
 
-**Production deployment is blocked before any Azure mutation.** On 2026-09-24,
-the Sweden Central Sandbox service accepted the immutable probe image but
-rejected sandbox creation with the required `Partial` inspection and
-`defaultAction: Deny`:
+**WARNING: `allow-all-mvp` removes outbound network isolation. All internet
+destinations are permitted, with no TLS inspection. A compromised prompt/model
+path could exfiltrate personal data to any destination.** Owner-only Entra
+ingress, exact model-visible tools, managed HTTP/native RPC restrictions,
+WhatsApp self-chat guards, and Google read-only scopes remain mandatory, but
+they are not an outbound network boundary.
+
+The user selected **No inspection + Allow all egress** for the temporary MVP.
+To accept that risk deliberately, set this in the separate `.env.hermes` or
+explicitly in the process environment:
+
+```dotenv
+HERMES_EGRESS_MODE=allow-all-mvp
+```
+
+The sample leaves this value blank. Deploy, replacement, deployment checks,
+and owner-relay access reject a missing, misspelled, or unverified mode before
+constructing configuration or Azure clients. There is no default Allow mode
+and no automatic service-error fallback. The raw sandbox request is exactly:
+
+```json
+{"defaultAction":"Allow","trafficInspection":"None"}
+```
+
+There are no hostname or advanced rules. Readback must retain both effective
+values (known enum spelling is case-normalized; null is not `"None"`); the known
+optional `hostRules` and `rules` members must be absent, null, or empty arrays.
+Nonempty rules, malformed known fields, or any other default/inspection value
+fail closed. For this **non-isolating MVP only**, unknown top-level metadata
+fields do not block solely because their names are new: diagnostics report their
+sorted field names and count, never their values, and explicitly do not rely on
+their semantics. Conservative rule/policy/security-bearing names (such as names
+containing `rule`, `host`, `allow`, `deny`, `inspect`, `network`, `proxy`, `tls` or
+`certificate`) still fail with an actionable name-only diagnostic. Malformed or
+oversized names also fail without being echoed. This classification is not a
+complete service schema or a proof of unrestricted reachability. It does not
+change the blocked hardened mode's semantics.
+
+A mismatch does not retry with Partial, Full, or another policy. Existing
+sandboxes with different policies are not silently modified.
+`HERMES_IDENTITY_HOST` and `HERMES_WHATSAPP_HOSTS` remain reserved inputs for a
+future hardened contract; **they do not constrain MVP egress**.
+
+TLS certificate and hostname verification remain enabled. This mode does not
+install inspection CAs, configure new proxies, or disable verification.
+The unchanged runtime still passes platform-provided `HTTP_PROXY`, `HTTPS_PROXY`
+and `NO_PROXY` (including lowercase variants), `SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` to child processes when present.
+Their presence, provenance and effective client trust under `None + Allow`
+remain unverified live. The isolated smoke check uses certifi and bypasses
+proxy settings, so it does not verify the runtime clients' trust configuration.
+CLI warnings and the host diagnostic
+status explicitly report the exfiltration risk and lack of isolation. Raw
+readback alone does not prove that every internet destination is reachable. Cleanup
+does not require accepting this unsafe opt-in: its ownership, confirmation and
+disk-preservation checks remain available with a missing or unusable mode.
+
+**Temporary does not mean automatically expiring.** Clearing or changing
+`HERMES_EGRESS_MODE` does not alter an existing sandbox's egress or stop its
+gateway, WhatsApp or Google credential use; it only blocks subsequent
+deploy/test/access commands. Within the currently supported modes, end that
+active exposure by cleaning up the owned compute. Default cleanup preserves
+the private disk and credentials; it does not revoke OAuth grants or delete
+retained data. Removing the local opt-in alone is not revocation.
+
+The opt-in permits the reviewed provisioning path; it is **not evidence of a
+successful live deployment** or permission for an agent to create resources.
+Cloud scope, existing Foundry inputs/permissions, image publication, and personal
+Google/WhatsApp onboarding remain separate explicit decisions.
+
+### Future hardened mode and preserved probe findings
+
+`HERMES_EGRESS_MODE=hardened-unverified` is reserved and always blocked. On
+2026-09-24, the Sweden Central Sandbox service rejected creation with `Partial`
+inspection and `defaultAction: Deny`:
 
 ```text
 Partial traffic inspection requires defaultAction 'Allow'
 ```
 
-`scripts/deploy_hermes.py` therefore stops before loading configuration or
-creating Azure clients/resources. There is no command-line or environment
-bypass. Do not change this to `Allow`, `None`, disable certificate verification,
-or assume an SDK object proves service support.
-
 The official [egress documentation](https://sandboxes.azure.com/docs/sandboxes/sandbox/egress)
-describes `Full` plus `Deny`, but it is a **separate experimental candidate**, not
-the production policy. Full inspection may change TLS/privacy boundaries:
+describes `Full` plus `Deny`, but it remains a **separate unverified candidate**,
+not an alternative selected by the MVP mode. Full inspection may change TLS/privacy boundaries:
 an inspector that terminates TLS can see credentials and content. An isolated
 non-personal probe does not authorize personal Google, WhatsApp, or Foundry
 traffic through it. CA provenance, delivery/rotation, actual client trust,
 hostname enforcement, and platform logging/retention require explicit evidence
-and approval. Hostname enforcement under `None` is unproven.
+and approval. The MVP requests no hostname enforcement under `None`.
 
 The short rejected-policy probe's temporary role and resource group were
 verified absent. Exact subscription, tenant, owner, resource, request, and role
@@ -36,13 +102,24 @@ assignment identifiers remain in local approval/evidence artifacts, not this
 repository. No production deployment or image publication is implied by these
 instructions.
 
-A separately approved, single non-personal Full+Deny experiment created a
+A separately approved non-personal Full+Deny experiment created a
 running sandbox with suspension disabled, but stopped before opening a port
 because the strict policy readback comparison failed. The offending raw fields
 were not captured, so this result is **inconclusive about Full policy support**,
 not a service rejection or a CA failure. No CA, ingress, WebSocket, or managed
 identity traffic was proved. Its temporary role and resource group were also
-verified absent; another paid attempt requires a separate decision.
+verified absent.
+
+One newly approved follow-up on 2026-09-25 also reached Running with suspension
+disabled and no public ports. Persisted create and authenticated GET summaries
+matched `Full`, `Deny`, and the exact requested host rule. **Our verifier stopped
+on two extra policy fields**, not an Azure Full-mode rejection. The redactor
+retained their count but lost their names and individual value types, leaving
+complete policy semantics unresolved. CA, ingress, WebSocket and MI stages
+were not reached; this is not a CA/authentication failure. That run's exact
+temporary assignment and resource group were independently confirmed absent.
+Its approval is consumed and its sealed evidence is unchanged. Nothing in the
+MVP choice reinterprets those unknown fields or establishes hardened support.
 
 ## Managed boundaries
 
@@ -58,7 +135,7 @@ verified absent; another paid attempt requires a separate decision.
 | Tools | Only `clarify` and `memory`, plus exactly three Google read-only tools when eligible. No generic filesystem, shell, browser, install, scheduling, or configuration tools. |
 | WhatsApp | Owner self-chat only, text only, locally authenticated bridge. Pairing is explicit and interactive; device keys are sensitive persistent data. |
 | Google | Gmail read-only and Calendar events read-only scopes, exact account and calendar allowlists, no attachments or writes. |
-| Egress | Exact approved hosts only; no broad Azure/Google/Facebook wildcard, guest package installation, or silent permissive fallback. The production policy is currently blocked as above. |
+| Egress | Deliberate temporary `allow-all-mvp`: `None` inspection + `Allow` default, no rules and **no outbound isolation**. Missing/unknown/hardened-unverified modes block deploy/test/access; no guest package installation or automatic fallback. |
 
 The runtime is a deliberately constrained assistant, not an arbitrary-code
 workspace. Native CLI/TUI dispatch and model-visible tool arrays are separately
@@ -108,6 +185,8 @@ subscription, tenant, authenticated owner object ID, dedicated resource names,
 and existing inference settings. `HERMES_IMAGE` must be a public immutable
 `@sha256:` reference; these scripts neither publish an image nor supply pull
 secrets. Do not copy a sample phone/account value as a real identity.
+Leave `HERMES_EGRESS_MODE` unset unless accepting the temporary unrestricted
+egress risk above. Setting host inputs does not restrict traffic in this mode.
 
 No credentials belong in `.env.hermes`. Process `HERMES_*` variables can override
 file values; changed key **names**, not their values, are reported. Check those
@@ -163,8 +242,9 @@ The verification layers preserve that runtime, its source bytes, and its image
 ancestry. Native/Node, production-entrypoint, and all five actual browser
 scenarios passed on these images without a runtime source overlay. These are
 offline checks with local test providers, not proof of live Azure ingress,
-egress, Foundry, or personal Google/WhatsApp access. The deployment gate above
-remains in force. Do not downgrade cryptography, inherit a compatibility
+egress, Foundry, or personal Google/WhatsApp access. The explicit mode gate above
+remains in force. The MVP request/configuration change does not alter runtime
+image sources, dependencies, or the control/runtime schema. Do not downgrade cryptography, inherit a compatibility
 override, or bypass dependency resolution.
 
 Build the separate image without publishing it:
@@ -187,15 +267,19 @@ complete source Dockerfile built. The separate manual
 `.github/workflows/hermes-image.yml` defaults to no publication; explicit
 publication is a separate decision and follows its offline image checks.
 
-## Deployment and access after the gate is resolved
+## Deployment and access with explicit MVP opt-in
 
-These commands describe the intended interface. **Deployment currently refuses
-them before Azure changes**, including `--replace`:
+Only after separately approving the cloud scope and deliberately setting
+`HERMES_EGRESS_MODE=allow-all-mvp`, use the exact-target interface:
 
 ```console
 python scripts/deploy_hermes.py --confirm-target "<full-hermes-group-resource-id>"
 python scripts/deploy_hermes.py --replace --confirm-target "<full-hermes-group-resource-id>"
 ```
+
+Both paths print the unrestricted-egress warning. Missing or unverified modes
+still refuse before configuration/Azure access, including `--replace`. Neither
+command assigns roles, provisions a model, or publishes an image.
 
 Replacement preserves the same DataDisk, waits for the old writer to disappear,
 uploads and verifies the nonsecret runtime atomically, applies controlled
@@ -219,7 +303,8 @@ persistent maintenance, is preserved rather than implicitly started or deleted.
 For transient failures, use controlled reconfiguration and then stop the gateway
 before retrying. For a broken image or unreachable/stopped compute, use the
 explicit, disk-preserving recovery procedure under [Cleanup](#cleanup), then
-plain deployment. Production deployment remains subject to the network gate.
+plain deployment. Deployment still requires the explicit mode opt-in and exact
+policy readback; recovery does not bypass those checks.
 
 Failure rolls back only a positively identified newly created sandbox, not the
 personal disk. Rollback requires a completed deletion and a confirming 404,
@@ -286,7 +371,8 @@ native Chat/PTY, sidebar RPC, and the read-only event feed remain available.
 Forbidden event-feed input is never forwarded and does not disconnect a normal
 subscriber.
 
-Guest egress does not constrain the owner's browser. The text renderer escapes
+The MVP guest has no outbound destination isolation; browser protections are
+separate and unchanged. The text renderer escapes
 HTML and does not turn Markdown images into automatic image elements. Proxy
 Content Security Policy restricts resources to the local application and the
 exact relay WebSocket endpoint, blocks remote media/frames/objects, and sends
@@ -318,12 +404,34 @@ Status has exactly `schema_version`, `dashboard`, `gateway`, `whatsapp`,
 connected. Unknown free space (`-1`) or insufficient headroom cannot establish
 readiness. A failed gateway should not remove the owner's diagnostic/control
 path.
+This guest control schema does not contain Azure policy. Use
+`scripts/test_hermes.py` for the host status envelope's separate `egress` section:
+it reports the selected mode, matched known policy fields, the name-only
+`readback` metadata, `outbound_isolation: false` and a prominent privacy warning.
+`raw_azure_policy` says `KNOWN MVP FIELDS MATCH`, not unrestricted-connectivity
+or hardened-network verification. Do not interpret a running component as
+hardened networking.
 
 ## Google onboarding and diagnostics
 
 Create a Desktop OAuth client in the user's Google project and enable Gmail
-and Calendar APIs. After the user has approved the data flow and the deployment
-gates are resolved, run on the owner computer:
+and Calendar APIs. Google onboarding needs a separate explicit decision accepting
+the personal-data flow under unrestricted MVP egress and completion of the
+applicable live deployment checks; local acceptance is not approval to connect.
+
+The unchanged Google helper does **not** require `HERMES_EGRESS_MODE`, print the
+MVP warning, or read back Azure egress. Its Google-policy comparison does not
+establish an outbound network boundary. Before connecting, run the host
+diagnostic with the deliberate opt-in still present and resolve policy errors:
+
+```console
+python scripts/test_hermes.py
+```
+
+This procedural check is not enforced by the Google helper. Matching known
+policy fields is not isolation, complete client-trust evidence, or approval
+for personal onboarding. Only after the separate decision and checks above,
+run on the owner computer:
 
 ```console
 python scripts/google_auth_hermes.py connect --client-secrets "<local-desktop-client.json>"
@@ -406,8 +514,18 @@ python -m unittest discover -s tests -p "test_hermes_*.py"
 
 The diagnostic script distinguishes raw-policy/runtime checks from unverified
 live inference, token-expiry soak, Google reads, WhatsApp delivery, and ingress
-identity/WS checks. The production network diagnostic remains tied to the
-blocked Partial policy; it is not a Full-mode fallback.
+identity/WS checks. It requires the explicit MVP opt-in just like deployment and
+reports the risk in both stderr and JSON. `--network` performs only a harmless
+public-CA HTTPS reachability check to `example.com`, with certificate/hostname
+verification, no environment proxy and no redirects. Its result is under
+`network`, not the former `partial_network` key. It does not contact a personal
+Foundry endpoint or Google/WhatsApp account, does not claim a platform deny, and
+cannot prove reachability to every destination. A failed check never changes
+trust or policy. Separately approved functional live validation still needs the
+six actual clients (`aiohttp`, `httpx`, `httpx2`, `requests`, `httplib2`, and Node)
+to reach the required approved service endpoints with normal certificate and
+hostname verification. A successful `example.com` smoke check is not that
+validation. The reserved hardened mode remains blocked.
 
 Host tests use explicit fakes and never obtain personal credentials. Image-only
 tests require the native pinned image and opt-in fixture flags. They use one

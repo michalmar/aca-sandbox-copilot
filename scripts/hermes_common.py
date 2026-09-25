@@ -38,6 +38,23 @@ INGRESS_AUDIENCES = {"https://auth.adcproxy.io/", "9f34678b-7f96-4c6d-ac69-b06b1
 LABELS = {"managed-by": "aca-sandbox-hermes"}
 MIN_FREE_BYTES = 256 * 1024 * 1024
 GOOGLE_HOSTS = ("oauth2.googleapis.com", "gmail.googleapis.com", "www.googleapis.com")
+MVP_EGRESS_MODE = "allow-all-mvp"
+MVP_EGRESS_WARNING = (
+    "WARNING: TEMPORARY allow-all-mvp mode has NO outbound network isolation. "
+    "All internet destinations are permitted by the requested mode, with no TLS inspection. "
+    "A compromised prompt/model path could exfiltrate personal data to any destination. "
+    "Entra owner-only ingress and managed tool restrictions remain required, but are not an egress boundary. "
+    "Policy readback and a smoke check are not proof of unrestricted connectivity."
+)
+_EGRESS_FIELD_NAME = re.compile(r"[A-Za-z_@][A-Za-z0-9_.-]{0,127}\Z")
+_POLICY_FIELD_TERMS = re.compile(
+    r"rule|host|action|inspect|deny|allow|destination|endpoint|network|egress|proxy|tls|certificate|"
+    r"policy|security|firewall|traffic|connection|filter|restrict|redirect|rewrite|transform|trust|"
+    r"credential|secret|token|permission|authorization|authentication|dns|cidr|ipv4|ipv6|"
+    r"outbound|inbound|routing|match|protocol|http|accesscontrol|header|identity|transport|enforc|crypt|"
+    r"route|intercept|password|passwd|oauth|bypass|override|exempt|exception|exclu|"
+    r"upstream|gateway|tunnel|forward|domain|fqdn|pattern"
+)
 _NAME = re.compile(r"[a-z][a-z0-9-]{1,61}[a-z0-9]\Z")
 _HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\Z")
 _IMAGE = re.compile(r"[a-z0-9][a-z0-9./:_-]+@sha256:[a-f0-9]{64}\Z")
@@ -50,7 +67,7 @@ _ENV_KEYS = {
     "HERMES_FOUNDRY_ENDPOINT", "HERMES_FOUNDRY_DEPLOYMENT", "HERMES_FOUNDRY_API_MODE",
     "HERMES_FOUNDRY_CONTEXT_LENGTH", "HERMES_FOUNDRY_SCOPE", "HERMES_WHATSAPP_PHONE",
     "HERMES_GOOGLE_ENABLED", "HERMES_GOOGLE_EXPECTED_EMAIL", "HERMES_GOOGLE_CALENDAR_IDS",
-    "HERMES_IDENTITY_HOST", "HERMES_WHATSAPP_HOSTS",
+    "HERMES_IDENTITY_HOST", "HERMES_WHATSAPP_HOSTS", "HERMES_EGRESS_MODE",
 }
 
 
@@ -191,6 +208,33 @@ def _read_env(path: Path) -> dict[str, str]:
     }
 
 
+def require_egress_mode(mode: str) -> str:
+    if mode == "hardened-unverified":
+        raise RuntimeError(
+            "BLOCKED: HERMES_EGRESS_MODE=hardened-unverified is not deployable. "
+            "Partial + Deny was rejected by the service; Full + Deny remains unverified because our "
+            "diagnostics did not classify extra returned policy fields. There is no automatic fallback."
+        )
+    if mode != MVP_EGRESS_MODE:
+        raise RuntimeError(
+            "BLOCKED: explicitly set HERMES_EGRESS_MODE=allow-all-mvp to accept unrestricted outbound "
+            "access and its data-exfiltration risk. Missing or unknown modes never enable deployment or checks. "
+            "The future hardened-unverified mode remains blocked."
+        )
+    return mode
+
+
+def warn_unrestricted_egress(mode: str) -> None:
+    require_egress_mode(mode)
+    logging.getLogger("hermes.egress").warning(MVP_EGRESS_WARNING)
+
+
+def load_egress_config(env_path: Path | None = None) -> Config:
+    values = _read_env(Path(env_path) if env_path is not None else ENV_PATH)
+    require_egress_mode(values.get("HERMES_EGRESS_MODE", ""))
+    return Config.from_values(values)
+
+
 @dataclass(frozen=True)
 class Config:
     subscription_id: str
@@ -214,6 +258,7 @@ class Config:
     google_calendar_ids: tuple[str, ...] = ("primary",)
     identity_host: str = ""
     whatsapp_hosts: tuple[str, ...] = ()
+    egress_mode: str = ""
 
     def __post_init__(self) -> None:
         _uuid(self.subscription_id, "HERMES_SUBSCRIPTION_ID")
@@ -233,7 +278,10 @@ class Config:
 
     @classmethod
     def from_env(cls, env_path: Path | None = None) -> Config:
-        values = _read_env(Path(env_path) if env_path is not None else ENV_PATH)
+        return cls.from_values(_read_env(Path(env_path) if env_path is not None else ENV_PATH))
+
+    @classmethod
+    def from_values(cls, values: dict[str, str]) -> Config:
         fields = {
             "subscription_id": "SUBSCRIPTION_ID", "tenant_id": "TENANT_ID",
             "owner_object_id": "OWNER_OBJECT_ID", "location": "LOCATION",
@@ -242,7 +290,7 @@ class Config:
             "image": "IMAGE", "foundry_endpoint": "FOUNDRY_ENDPOINT", "foundry_deployment": "FOUNDRY_DEPLOYMENT",
             "foundry_api_mode": "FOUNDRY_API_MODE", "foundry_scope": "FOUNDRY_SCOPE",
             "whatsapp_phone": "WHATSAPP_PHONE", "google_expected_email": "GOOGLE_EXPECTED_EMAIL",
-            "identity_host": "IDENTITY_HOST",
+            "identity_host": "IDENTITY_HOST", "egress_mode": "EGRESS_MODE",
         }
         kwargs: dict[str, Any] = {
             key: values[f"HERMES_{suffix}"]
@@ -461,46 +509,76 @@ def configure_port(sandbox: SandboxClient, config: Config, *, object_ids: tuple[
     return validate_ports(raw_sandbox(sandbox), config, sandbox.sandbox_id, object_ids=object_ids)
 
 
-def egress_document(hosts: tuple[str, ...] | list[str]) -> dict[str, Any]:
-    normalized = sorted({exact_host(host) for host in hosts})
-    return {
-        "defaultAction": "Deny", "trafficInspection": "Partial",
-        "hostRules": [{"pattern": host, "action": "Allow"} for host in normalized],
-    }
+def egress_document(mode: str) -> dict[str, Any]:
+    require_egress_mode(mode)
+    return {"defaultAction": "Allow", "trafficInspection": "None"}
 
 
 def deployment_egress(config: Config) -> dict[str, Any]:
-    runtime_document(config)
-    if not config.identity_host or not config.whatsapp_hosts:
-        raise ValueError("Deployment is blocked until the MI path and minimal WhatsApp hosts are verified.")
-    return egress_document([
-        urlsplit(config.foundry_endpoint).hostname, config.identity_host,
-        *GOOGLE_HOSTS, *config.whatsapp_hosts,
-    ])
+    return egress_document(config.egress_mode)
 
 
-def validate_egress(raw: dict[str, Any], expected: dict[str, Any]) -> None:
+def _policy_bearing_field(name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
+    words = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    # Preserve both short-word boundaries and acronym plurals (CAId, CAs).
+    plural_words = re.sub(r"([A-Z])([A-Z][a-z]{2,})", r"\1_\2", words)
+    words = re.sub(r"([A-Z])([A-Z][a-z])", r"\1_\2", words) + "_" + plural_words
+    return bool(_POLICY_FIELD_TERMS.search(normalized)) or ("." in name and not name.startswith("@")) or bool(
+        set(re.split(r"[^a-z0-9]+", words.casefold())) & {
+            "ca", "cas", "acl", "acls", "ip", "ips", "port", "ports", "sni", "snis",
+            "ssl", "ssls", "cert", "certs", "auth", "auths", "key", "keys", "sas", "url", "urls",
+        }
+    )
+
+
+def validate_egress(raw: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
+    if expected != egress_document(MVP_EGRESS_MODE):
+        raise RuntimeError("BLOCKED: expected egress request must be exactly None + Allow, without rules.")
     policy = raw.get("egressPolicy")
     if (
         not isinstance(policy, dict)
-        or policy.get("defaultAction") != "Deny"
-        or policy.get("trafficInspection") != "Partial"
-        or policy.get("rules")
-        or sorted(policy.get("hostRules") or [], key=lambda row: str(row)) !=
-        sorted(expected["hostRules"], key=lambda row: str(row))
-        or any(value for key, value in policy.items() if key not in {"defaultAction", "trafficInspection", "hostRules", "rules"})
+        or not isinstance(policy.get("defaultAction"), str) or policy["defaultAction"].casefold() != "allow"
+        or not isinstance(policy.get("trafficInspection"), str) or policy["trafficInspection"].casefold() != "none"
+        or any(policy.get(key) is not None and policy[key] != [] for key in ("hostRules", "rules"))
     ):
-        raise RuntimeError("BLOCKED: raw egress policy differs from the exact deny-default Partial policy.")
+        raise RuntimeError(
+            "BLOCKED: raw egress policy differs from explicit None + Allow with no known rules. "
+            "No inspection, rule, or service-error fallback is permitted."
+        )
+    unknown = set(policy) - {"defaultAction", "trafficInspection", "hostRules", "rules"}
+    if len(unknown) > 64 or any(not isinstance(name, str) or not _EGRESS_FIELD_NAME.fullmatch(name) for name in unknown):
+        raise RuntimeError("BLOCKED: unclassified policy field names exceed the safe name-only diagnostic shape; values suppressed.")
+    names = sorted(unknown)
+    suspicious = [name for name in names if _policy_bearing_field(name)]
+    if suspicious:
+        raise RuntimeError(
+            f"BLOCKED: MVP policy/security-bearing fields need classification "
+            f"(names only, count={len(suspicious)}): {json.dumps(suspicious)}. "
+            "Values are suppressed; no fallback is permitted."
+        )
+    if names:
+        logging.getLogger("hermes.egress").warning(
+            "MVP readback contains unknown metadata field names (count=%s): %s. "
+            "Values are not recorded; semantics are not relied on. This is not proof of unrestricted connectivity.",
+            len(names), json.dumps(names),
+        )
+    return {
+        "known_fields_match": True, "unknown_field_names": names, "unknown_field_count": len(names),
+        "unknown_field_semantics": "NOT RELIED ON", "unrestricted_connectivity": "NOT VERIFIED",
+    }
 
 
-def configure_egress(sandbox: SandboxClient, policy: dict[str, Any]) -> None:
-    validate_egress({"egressPolicy": policy}, policy)
+def configure_egress(sandbox: SandboxClient, config: Config) -> None:
+    policy = deployment_egress(config)
+    warn_unrestricted_egress(config.egress_mode)
     sandbox._dp_post(f"{sandbox._sbx_path}/egresspolicy", policy)
     validate_egress(raw_sandbox(sandbox), policy)
 
 
 def sandbox_document(config: Config, *, disk_id: str, egress: dict[str, Any]) -> dict[str, Any]:
-    validate_egress({"egressPolicy": egress}, egress)
+    if egress != deployment_egress(config):
+        raise ValueError("Sandbox request must use the exact explicitly selected egress policy, without extra fields.")
     return {
         "sourcesRef": {"diskImage": {"id": disk_id}},
         "resources": {"cpu": "2000m", "memory": "4096Mi", "disk": "20Gi"},
@@ -754,33 +832,27 @@ print(json.dumps(results))
 """
 
 
-def verify_partial_network(sandbox: SandboxClient, config: Config) -> dict[str, Any]:
+def verify_mvp_network(sandbox: SandboxClient, config: Config) -> dict[str, Any]:
     policy = deployment_egress(config)
     validate_egress(raw_sandbox(sandbox), policy)
-    allowed = sorted({urlsplit(config.foundry_endpoint).hostname, *GOOGLE_HOSTS, *config.whatsapp_hosts})
-    denied_host = "example.com"
-    if denied_host in {row["pattern"] for row in policy["hostRules"]}:
-        raise RuntimeError("The negative network-probe host must not be allowed.")
+    hosts = ["example.com"]
     result = parse_json(exec_checked(
-        sandbox, [PYTHON, "-c", _NETWORK_PROBE, json.dumps([*allowed, denied_host])]
+        sandbox, [PYTHON, "-c", _NETWORK_PROBE, json.dumps(hosts)]
     ).encode())
-    if not isinstance(result, dict) or any(
-        not isinstance(result.get(host), dict) or result[host].get("public_ca_tls") is not True for host in allowed
+    if (
+        not isinstance(result, dict) or set(result) != set(hosts)
+        or any(
+            not isinstance(result[host], dict) or set(result[host]) != {"public_ca_tls", "http_status"}
+            or result[host]["public_ca_tls"] is not True
+            or type(result[host]["http_status"]) is not int or not 100 <= result[host]["http_status"] <= 599
+            for host in hosts
+        )
     ):
-        raise RuntimeError("BLOCKED: at least one explicit host failed public-CA-only TLS in Partial mode.")
-    if not isinstance(result.get(denied_host), dict) or "http_status" in result[denied_host]:
-        raise RuntimeError("BLOCKED: a disallowed hostname reached an HTTP origin.")
-    deadline = time.monotonic() + 30
-    while True:
-        audit = sandbox._dp_get(f"{sandbox._sbx_path}/egress-decisions")
-        entries = audit.get("networkEgress", {}).get("denied", []) if isinstance(audit, dict) else []
-        if any(isinstance(row, dict) and row.get("host") == denied_host for row in entries):
-            break
-        if time.monotonic() >= deadline:
-            raise RuntimeError("BLOCKED: no platform deny decision proves the negative hostname test.")
-        time.sleep(2)
-    return {"traffic_inspection": "Partial", "public_ca_tls_hosts": allowed, "denied_host": denied_host,
-            "platform_deny_observed": True}
+        raise RuntimeError("MVP network check failed verified public-CA HTTPS; no alternate trust or policy was tried.")
+    return {
+        "egress_mode": MVP_EGRESS_MODE, "traffic_inspection": "None", "default_action": "Allow",
+        "outbound_isolation": False, "public_ca_tls_hosts": hosts, "all_destinations_tested": False,
+    }
 
 
 def confirm_target(config: Config, value: str | None) -> None:

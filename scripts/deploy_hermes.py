@@ -14,23 +14,13 @@ from azure.core.exceptions import AzureError, HttpResponseError, ResourceNotFoun
 from hermes_common import (
     AzureClients, Config, CONTROL, GatewayHandoff, RUNTIME_PATH, assert_group_owned, assert_labels,
     assert_no_suspend, assert_owner, configure_port, confirm_target, control_status,
-    delete_sandbox_confirmed, deployment_egress, exec_checked, owned_inventory,
+    delete_sandbox_confirmed, deployment_egress, exec_checked, load_egress_config, owned_inventory,
     quiesce_gateway, raw_sandbox, read_control_status, read_runtime,
     runtime_document, sandbox_document, upload_private_file, validate_egress,
-    validate_ports, verify_partial_network, wait_running,
+    validate_ports, verify_mvp_network, wait_running, warn_unrestricted_egress,
 )
 
 LOG = logging.getLogger("hermes.deploy")
-
-
-def assert_deployment_supported() -> None:
-    raise RuntimeError(
-        "BLOCKED: the swedencentral Sandbox service rejected Partial + defaultAction Deny on 2026-09-24 "
-        "(HTTP 400: Partial traffic inspection requires defaultAction 'Allow'). "
-        "Production Hermes deployment is disabled before Azure changes until the network policy is "
-        "explicitly reviewed and verified. An isolated Full + Deny experiment does not authorize production "
-        "adoption. No Allow, None, or TLS-verification fallback is permitted. See docs/hermes.md."
-    )
 
 
 def provision_group(config: Config, clients: AzureClients) -> None:
@@ -175,11 +165,11 @@ def report_gateway_state(status: dict) -> None:
 
 
 def deploy(config: Config, clients: AzureClients, *, replace: bool = False) -> str:
-    assert_deployment_supported()
+    egress = deployment_egress(config)
+    warn_unrestricted_egress(config.egress_mode)
     document = runtime_document(config)
     if not config.image:
         raise ValueError("Supply an existing public immutable HERMES_IMAGE before deployment.")
-    egress = deployment_egress(config)
     assert_owner(clients.credential, config)
     provision_group(config, clients)
     sandboxes, images, volumes = owned_inventory(config, clients)
@@ -236,7 +226,7 @@ def deploy(config: Config, clients: AzureClients, *, replace: bool = False) -> s
         # Reconfigure is the explicit, serialized stop/apply/revalidate path.
         if volumes:
             exec_checked(sandbox, [*CONTROL, "reconfigure"])
-        verify_partial_network(sandbox, config)
+        verify_mvp_network(sandbox, config)
         deadline = time.monotonic() + 180
         while True:
             status = control_status(sandbox)
@@ -304,8 +294,7 @@ def main() -> None:
     parser.add_argument("--replace", action="store_true", help="Replace the owned sandbox, preserving its single-writer DataDisk.")
     parser.add_argument("--confirm-target", help="Exact full Sandbox Group resource ID authorizing this operation.")
     args = parser.parse_args()
-    assert_deployment_supported()
-    config = Config.from_env(args.env_file)
+    config = load_egress_config(args.env_file)
     confirm_target(config, args.confirm_target)
     with AzureClients.create(config) as clients:
         identifier = deploy(config, clients, replace=args.replace)
