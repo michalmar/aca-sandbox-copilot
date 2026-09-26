@@ -11,6 +11,7 @@ import re
 import shlex
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -39,6 +40,17 @@ LABELS = {"managed-by": "aca-sandbox-hermes"}
 MIN_FREE_BYTES = 256 * 1024 * 1024
 GOOGLE_HOSTS = ("oauth2.googleapis.com", "gmail.googleapis.com", "www.googleapis.com")
 MVP_EGRESS_MODE = "allow-all-mvp"
+EGRESS_SCHEMA_VERSION = "2026-09-01-preview"
+EGRESS_SCHEMA_COMMIT = "799f241aaa07e2485e0b06cc8f6f3b3caefd29da"
+EGRESS_SCHEMA_MODEL_SHA256 = "79b33ac8c0546931584fb0d03bbe2338942feaeb9549b6f6602e5b2d05fafe37"
+_EGRESS_ROOT_FIELDS = frozenset({"defaultAction", "trafficInspection", "hostRules", "rules", "enforcementMode", "http"})
+_EGRESS_BLOCKED_FIELDS = frozenset({"tds", "transportRules", "validationWarnings"})
+_EGRESS_HTTP_FIELDS = frozenset({"defaultAction", "trafficInspection", "hostRules", "rules", "enforcementMode"})
+_EGRESS_ENUMS = {
+    "defaultAction": ("Allow", "Deny"),
+    "trafficInspection": ("Legacy", "Partial", "Full", "None"),
+    "enforcementMode": ("Enforced", "Audit"),
+}
 MVP_EGRESS_WARNING = (
     "WARNING: TEMPORARY allow-all-mvp mode has NO outbound network isolation. "
     "All internet destinations are permitted by the requested mode, with no TLS inspection. "
@@ -524,18 +536,110 @@ def _policy_bearing_field(name: str) -> bool:
     # Preserve both short-word boundaries and acronym plurals (CAId, CAs).
     plural_words = re.sub(r"([A-Z])([A-Z][a-z]{2,})", r"\1_\2", words)
     words = re.sub(r"([A-Z])([A-Z][a-z])", r"\1_\2", words) + "_" + plural_words
-    return bool(_POLICY_FIELD_TERMS.search(normalized)) or ("." in name and not name.startswith("@")) or bool(
+    return name in _EGRESS_BLOCKED_FIELDS or bool(_POLICY_FIELD_TERMS.search(normalized)) or (
+        "." in name and not name.startswith("@")
+    ) or bool(
         set(re.split(r"[^a-z0-9]+", words.casefold())) & {
             "ca", "cas", "acl", "acls", "ip", "ips", "port", "ports", "sni", "snis",
-            "ssl", "ssls", "cert", "certs", "auth", "auths", "key", "keys", "sas", "url", "urls",
+            "ssl", "ssls", "cert", "certs", "auth", "auths", "key", "keys", "sas", "url", "urls", "tds",
         }
     )
 
 
-def validate_egress(raw: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
+def _egress_value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    for kind, name in ((bool, "boolean"), (str, "string"), (dict, "object"), (list, "array"), ((int, float), "number")):
+        if isinstance(value, kind):
+            return name
+    return "unsupported"
+
+
+def _egress_field_observation(fields: dict, name: str, *, normalize: bool = False) -> dict[str, Any]:
+    if name not in fields:
+        return {"present": False, "type": "absent"}
+    value = fields[name]
+    result: dict[str, Any] = {"present": True, "type": _egress_value_type(value)}
+    if isinstance(value, list):
+        result["count"] = len(value)
+    if isinstance(value, str):
+        for literal in _EGRESS_ENUMS.get(name, ()):
+            if value == literal or (normalize and value.casefold() == literal.casefold()):
+                result["public_enum"] = literal
+                break
+    return result
+
+
+def egress_policy_observation(raw: Any, *, operation: Literal["create", "get"] = "get") -> dict[str, Any]:
+    """Project only fixed-schema shape and known literals, never response content."""
+    if operation not in ("create", "get"):
+        raise ValueError("Egress observation operation must be create or get.")
+    response = raw if isinstance(raw, dict) else {}
+    observation: dict[str, Any] = {
+        "schema_version": 1, "schema_api_version": EGRESS_SCHEMA_VERSION,
+        "schema_commit": EGRESS_SCHEMA_COMMIT, "schema_model_sha256": EGRESS_SCHEMA_MODEL_SHA256, "operation": operation,
+        "validation": "NOT EVALUATED", "outbound_isolation": False,
+        "response_type": _egress_value_type(raw),
+        "policy": _egress_field_observation(response, "egressPolicy"),
+    }
+    policy = response.get("egressPolicy")
+    if not isinstance(policy, dict):
+        return observation
+    known = _EGRESS_ROOT_FIELDS | _EGRESS_BLOCKED_FIELDS
+    for name in sorted(known):
+        observation[name] = _egress_field_observation(
+            policy, name, normalize=name in {"defaultAction", "trafficInspection"},
+        )
+    observation["unclassified_field_count"] = len(policy) - sum(name in policy for name in known)
+    http = policy.get("http")
+    if isinstance(http, dict):
+        http_known = _EGRESS_HTTP_FIELDS | {"defaultForward"}
+        observation["http"]["fields"] = {
+            name: _egress_field_observation(http, name) for name in sorted(http_known)
+        }
+        observation["http"]["unclassified_field_count"] = len(http) - sum(name in http for name in http_known)
+    return observation
+
+
+def _egress_extra_names(fields: dict, known: frozenset[str]) -> list[str]:
+    count = len(fields) - sum(name in fields for name in known)
+    if count > 64:
+        raise RuntimeError("BLOCKED: unclassified policy field names exceed the safe name-only diagnostic shape; values suppressed.")
+    names = [name for name in fields if name not in known]
+    if any(not isinstance(name, str) or not _EGRESS_FIELD_NAME.fullmatch(name) for name in names):
+        raise RuntimeError("BLOCKED: unclassified policy field names exceed the safe name-only diagnostic shape; values suppressed.")
+    return sorted(names)
+
+
+def _validate_enforcement_mode(policy: dict, location: str) -> None:
+    if "enforcementMode" in policy and (
+        not isinstance(policy["enforcementMode"], str)
+        or policy["enforcementMode"] not in _EGRESS_ENUMS["enforcementMode"]
+    ):
+        raise RuntimeError(
+            f"BLOCKED: {location}.enforcementMode must be absent or exactly Enforced/Audit; values suppressed."
+        )
+
+
+def validate_egress(
+    raw: Any, expected: dict[str, Any], *, operation: Literal["create", "get"] = "get",
+    capture: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Capture before checking; a supplied durable sink must persist or raise."""
+    observation = egress_policy_observation(raw, operation=operation)
+    logging.getLogger("hermes.egress").warning(
+        "MVP policy observation before validation (no outbound isolation): %s",
+        json.dumps(observation, sort_keys=True),
+    )
+    if capture is not None:
+        try:
+            capture(observation)
+        except Exception:
+            # A persistence failure must block acceptance without exposing sink paths or content.
+            raise RuntimeError("BLOCKED: redacted egress capture failed; policy acceptance refused. Details suppressed.") from None
     if expected != egress_document(MVP_EGRESS_MODE):
         raise RuntimeError("BLOCKED: expected egress request must be exactly None + Allow, without rules.")
-    policy = raw.get("egressPolicy")
+    policy = raw.get("egressPolicy") if isinstance(raw, dict) else None
     if (
         not isinstance(policy, dict)
         or not isinstance(policy.get("defaultAction"), str) or policy["defaultAction"].casefold() != "allow"
@@ -546,10 +650,31 @@ def validate_egress(raw: dict[str, Any], expected: dict[str, Any]) -> dict[str, 
             "BLOCKED: raw egress policy differs from explicit None + Allow with no known rules. "
             "No inspection, rule, or service-error fallback is permitted."
         )
-    unknown = set(policy) - {"defaultAction", "trafficInspection", "hostRules", "rules"}
-    if len(unknown) > 64 or any(not isinstance(name, str) or not _EGRESS_FIELD_NAME.fullmatch(name) for name in unknown):
-        raise RuntimeError("BLOCKED: unclassified policy field names exceed the safe name-only diagnostic shape; values suppressed.")
-    names = sorted(unknown)
+    _validate_enforcement_mode(policy, "egressPolicy")
+    if "http" in policy:
+        http = policy["http"]
+        if (
+            not isinstance(http, dict) or http.get("defaultAction") != "Allow"
+            or http.get("trafficInspection") != "None"
+            or any(name in http and (not isinstance(http[name], list) or http[name]) for name in ("hostRules", "rules"))
+        ):
+            raise RuntimeError(
+                "BLOCKED: http must explicitly specify defaultAction=Allow and trafficInspection=None, "
+                "with absent or empty rule arrays. No inheritance or alias precedence is assumed; values suppressed."
+            )
+        _validate_enforcement_mode(http, "http")
+        if (
+            "enforcementMode" in policy and "enforcementMode" in http
+            and policy["enforcementMode"] != http["enforcementMode"]
+        ):
+            raise RuntimeError("BLOCKED: root/http enforcementMode conflict; neither value takes precedence.")
+        extra = _egress_extra_names(http, _EGRESS_HTTP_FIELDS)
+        if extra:
+            raise RuntimeError(
+                f"BLOCKED: http policy/security-bearing fields are unsupported "
+                f"(names only, count={len(extra)}): {json.dumps(extra)}. Values are suppressed; no fallback is permitted."
+            )
+    names = _egress_extra_names(policy, _EGRESS_ROOT_FIELDS)
     suspicious = [name for name in names if _policy_bearing_field(name)]
     if suspicious:
         raise RuntimeError(
@@ -566,6 +691,7 @@ def validate_egress(raw: dict[str, Any], expected: dict[str, Any]) -> dict[str, 
     return {
         "known_fields_match": True, "unknown_field_names": names, "unknown_field_count": len(names),
         "unknown_field_semantics": "NOT RELIED ON", "unrestricted_connectivity": "NOT VERIFIED",
+        "observation": observation,
     }
 
 
@@ -832,9 +958,12 @@ print(json.dumps(results))
 """
 
 
-def verify_mvp_network(sandbox: SandboxClient, config: Config) -> dict[str, Any]:
+def verify_mvp_network(
+    sandbox: SandboxClient, config: Config, *,
+    capture: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     policy = deployment_egress(config)
-    validate_egress(raw_sandbox(sandbox), policy)
+    validate_egress(raw_sandbox(sandbox), policy, capture=capture)
     hosts = ["example.com"]
     result = parse_json(exec_checked(
         sandbox, [PYTHON, "-c", _NETWORK_PROBE, json.dumps(hosts)]

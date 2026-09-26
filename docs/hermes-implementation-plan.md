@@ -4,15 +4,17 @@ Stav: plán schválen Opus 5.5 po třetím review (9,5/10); lokální
 implementace následně přijata s hodnocením A 9,60/10, B7 10/10
 a C 10/10. Dočasná B8 změna pro MVP egress byla samostatně přijata
 v review 9,2 -> 9,9/10 a přesný finální zdroj ještě v neskórovaném
-uzavření bez blockerů.
+uzavření bez blockerů. B9 kompatibilita s novou HTTP egress schema
+byla přijata 9,6 -> 9,9/10.
 U A nezůstávají opravitelné nálezy; zbývající odpočet je za přiznanou
 strukturální složitost, nikoli neopravené vady. Přesné lokální image
 a jejich integrační brány prošly. Všech 50 implementačních souborů bylo
 předáno do hlavního checkoutu a znovu ověřeno včetně celé hostitelské sady.
-Živé nasazení je nadále BLOCKED na samostatném cloudovém schválení
-a chybějících vstupech. Souhlasy a výsledky izolovaných pokusů jsou
-v §11; další pokus ani publikace nejsou automaticky povolené.
-Datum: 2026-09-25.
+První skutečný MVP deploy byl bezpečně ukončen a plně uklizen poté,
+co Azure vrátil novější policy pole, která B8 neuměl vyhodnotit.
+B9 tento konkrétní lokální blocker opravuje; druhý cloudový pokus
+zůstává BLOCKED na samostatném schválení. Souhlasy a výsledky jsou
+v §11; další pokus není automaticky povolený. Datum: 2026-09-26.
 
 ## 1. Cíl, rozsah a potvrzená rozhodnutí
 
@@ -821,6 +823,38 @@ pokus není schválen. Následuje pouze omezená read-only analýza
 ověřovače a veřejného schématu, nikoli domýšlení chybějící odpovědi,
 oslabení policy nebo další placené opakování.
 
+Dne 2026-09-26 uživatel následně schválil publikaci přesně otestované
+Hermes image a skutečný persistentní MVP deploy s
+`HERMES_EGRESS_MODE=allow-all-mvp`. GitHub Actions run `36231347007`
+publikoval veřejný `linux/amd64` digest
+`ghcr.io/michalmar/aca-sandbox-hermes@sha256:246523149f6db56ff21140315d2fa950103e4c4f70342893118db82106a1557f`.
+Správný Azure profil byl výhradně `AZURE_CONFIG_DIR=~/.azure-365`;
+subscription, tenant, owner, Foundry `demo-swe`, deployment `gpt-6-sol`,
+context cap 800000 a minimální role byly ověřeny před mutací.
+
+Run `eba84cb5-d038-407d-8379-c7e7a009e587` vytvořil nový RG/group,
+ownerovi přidělil group-scoped SandboxGroup Data Owner a skupinové MI
+Foundry User pouze na `demo-swe`. Image import prošel, jediný sandbox
+dosáhl `Running`, `autoSuspend=false`, `ports=[]`; create i
+autentizovaný GET shodně vrátily známé `Allow`, `None`, prázdné
+`hostRules` a nepřítomné `rules`. B8 však fail closed odmítl dvě nyní
+pojmenovaná security-bearing pole `enforcementMode` a `http`, jejichž
+hodnoty ani typy stará bezpečná projekce nezachovala. Nebyl nahrán
+runtime, otevřen port ani proveden TLS smoke, inference, WhatsApp nebo
+Google krok. Není to odmítnutí `Allow + None` službou.
+
+Rollback odstranil sandbox, image, obě přesná role assignment ID,
+group i RG. Samostatný nový proces s vyhrazeným Azure profilem potvrdil
+RG/group/assignment GET 404; nezůstaly běžící prostředky ani role.
+Oficiální TypeSpec `2026-09-01-preview` následně doložil
+`enforcementMode` (`Enforced`/`Audit`) a strukturovanou `http` sekci.
+Použitý SDK `0.1.0b4` nad `2026-02-01-preview` tato pole zahazuje.
+B9 proto bezpečně projektuje pouze přítomnost, typy, počty a schválené
+enumy, vyžaduje nezávislé root i HTTP `Allow + None`, prázdná pravidla,
+kompatibilní enforcement a odmítá forwarding, `tds`, transport rules,
+validation warnings, konflikty a secret-bearing obsah. Další live
+deploy vyžaduje nový jednorázový driver, durable capture a nový souhlas.
+
 Pro plán a lokální implementaci nejsou potřeba tajné hodnoty. Až bude
 implementace připravená, uživatel bezpečnou lokální konfigurací dodá:
 
@@ -858,7 +892,7 @@ příslušných session.
 | Proud | Dosavadní skóre Opus 5.5 | Stav |
 | --- | --- | --- |
 | A: runtime a WhatsApp | 6,2 -> 7,8 -> 8,0; náhradní kritik 9,15 -> 9,60/10 | Finální A6 přijata bez opravitelných nálezů či vad důkazů. Opravené lifecycle/RPC, skutečný bridge, pre-tool `@reference` I/O a přísný dependency graph. Prošly přesné image, 121 nativních Python a 12 Node testů, skutečný entrypoint a browser scénáře. Zbývající odpočet je za strukturální patchování upstreamu, dvě schválené výjimky a zdokumentované provozní limity; není důvod vyrábět další nezměněná review nebo tvrdit 10/10. |
-| B: Azure a přístup | B7: 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10; B8 MVP: 9,2 -> 9,9/10 + neskórované exact-source ACCEPT | B7 zůstává historicky schválený hardened základ. B8 mění pouze sedm host-side provisioning/docs/test souborů: vyžaduje explicitní `allow-all-mvp`, přesné `None` + `Allow`, žádná známá pravidla, canary-safe metadata diagnostiku a prominentní warning. Náhradní Opus 5.5 uzavřel F1/F2/F3/F1-R bez blockerů. Runtime/image/C/workflow/dependency bytes zůstaly identické; skóre není schválení živého Azure nasazení. |
+| B: Azure a přístup | B7: 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10; B8 MVP: 9,2 -> 9,9/10 + neskórované ACCEPT; B9 schema: 9,6 -> 9,9/10 ACCEPT | B7 zůstává historicky schválený hardened základ. B8 zavedl explicitní `allow-all-mvp`. B9 po plně uklizeném live blockeru přidává fixed-schema projekci a nezávislé root/HTTP `Allow + None` ověření, enforcement enumy, durable create/get/get capture a fail-closed odmítnutí rules/forwarding/transport sekcí. Změnil čtyři host-side soubory; runtime/image/C/workflow/dependency bytes zůstaly identické. Skóre není schválení druhého live pokusu. |
 | C: Google read-only | 8,6 -> 9,8 -> 10/10; samostatná integrační revize C4 znovu 10/10 | Předaný C4 patch je nezávisle zreviewovaný, 104 lokálních testů prošlo. Nativní timing/cancellation a fake-bridge WhatsApp tools jsou další offline integrační důkazy. Osobní OAuth/P9/soak tím neprošly. |
 
 Žádný z těchto výsledků neodstraňuje blokaci produkčního deploye ani
@@ -881,18 +915,19 @@ patch A6/B7/C4, SHA-256
 Následně byl aplikován pouze reviewovaný B8 delta patch pro MVP egress,
 SHA-256
 `44adce523afbcaed1e83b0f0173c6e79559dd4267e649066f87d2bb94dc435e6`.
+Po schema výzkumu byl aplikován reviewovaný B9 delta patch, SHA-256
+`6536df22e19e207ec93978f743edc741f9cb15b78cc6a85a6069ffd005b1d938`.
 Všech 50 souborů včetně executable bitů odpovídá finálnímu manifestu;
 tento plán je samostatný doprovodný dokument. Původní Copilot implementace
 zůstala beze změny, kromě odkazu v README a dvou pravidel `.gitignore`.
 Nevznikl commit, push, PR ani publikace image.
 
-Finální B8 replay před předáním: B sada **184 celkem / 170 prošlo /
-14 image-only přeskočeno**, úplná host sada **416 / 349 / 67** a přesná
-existující SDK image **52 / 52 / 0**. Přesná množina 67 přeskočených ID
-i důvodů odpovídá A6 image-covered sadě. Runtime/image vstupy se
-nezměnily, proto se image znovu nestavěly. Po aplikaci do hlavního
-checkoutu se tyto brány opakují; cloudové hlášky v jednotkových testech
-pocházejí z mocků, nikoli nových zásahů do Azure.
+Finální B9 replay před předáním: B sada **205 celkem / 191 prošlo /
+14 image-only přeskočeno**, úplná host sada **437 / 370 / 67** a přesná
+existující SDK image **200 / 200 / 0** (původních 52 bran plus 148
+policy/lifecycle kontraktů). Přesná množina 67 přeskočených ID i důvodů
+odpovídá A6 image-covered sadě. Runtime/image vstupy se nezměnily,
+proto se image znovu nestavěly.
 
 Provozní návod je v [hermes.md](hermes.md). Schválení lokálního kódu
 neodemyká produkční deploy: zbývá samostatně povolené živé ověření sítě,

@@ -7,7 +7,9 @@ import argparse
 import json
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from azure.core.exceptions import AzureError, HttpResponseError, ResourceNotFoundError
 
@@ -164,7 +166,10 @@ def report_gateway_state(status: dict) -> None:
         )
 
 
-def deploy(config: Config, clients: AzureClients, *, replace: bool = False) -> str:
+def deploy(
+    config: Config, clients: AzureClients, *, replace: bool = False,
+    egress_capture: Callable[[dict[str, Any]], None] | None = None,
+) -> str:
     egress = deployment_egress(config)
     warn_unrestricted_egress(config.egress_mode)
     document = runtime_document(config)
@@ -177,7 +182,7 @@ def deploy(config: Config, clients: AzureClients, *, replace: bool = False) -> s
         sandbox = clients.group.get_sandbox_client(sandboxes[0].id)
         raw = raw_sandbox(sandbox)
         assert_no_suspend(raw)
-        validate_egress(raw, egress)
+        validate_egress(raw, egress, capture=egress_capture)
         validate_ports(raw, config, sandbox.sandbox_id)
         if read_runtime(sandbox) != document:
             raise RuntimeError("Runtime differs. Use explicit --replace or controlled reconfigure; nothing was changed.")
@@ -211,11 +216,14 @@ def deploy(config: Config, clients: AzureClients, *, replace: bool = False) -> s
         created = clients.group._dp_put(
             f"{clients.group._group_path}/sandboxes", sandbox_document(config, disk_id=image_id, egress=egress)
         )
-        if not isinstance(created, dict) or not isinstance(created.get("id"), str) or not created["id"]:
+        identifier = created.get("id") if isinstance(created, dict) else None
+        if isinstance(identifier, str) and identifier:
+            sandbox = clients.group.get_sandbox_client(identifier)
+        validate_egress(created, egress, operation="create", capture=egress_capture)
+        if sandbox is None:
             raise RuntimeError("Sandbox creation returned no valid ID; checking exact new-image ownership for rollback.")
-        sandbox = clients.group.get_sandbox_client(created["id"])
         raw = wait_running(sandbox)
-        validate_egress(raw, egress)
+        validate_egress(raw, egress, capture=egress_capture)
         upload_private_file(
             sandbox, destination=RUNTIME_PATH,
             content=(json.dumps(document, indent=2) + "\n").encode("utf-8"),
@@ -226,7 +234,7 @@ def deploy(config: Config, clients: AzureClients, *, replace: bool = False) -> s
         # Reconfigure is the explicit, serialized stop/apply/revalidate path.
         if volumes:
             exec_checked(sandbox, [*CONTROL, "reconfigure"])
-        verify_mvp_network(sandbox, config)
+        verify_mvp_network(sandbox, config, capture=egress_capture)
         deadline = time.monotonic() + 180
         while True:
             status = control_status(sandbox)

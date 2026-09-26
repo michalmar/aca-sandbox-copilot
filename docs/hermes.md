@@ -31,17 +31,56 @@ and no automatic service-error fallback. The raw sandbox request is exactly:
 {"defaultAction":"Allow","trafficInspection":"None"}
 ```
 
-There are no hostname or advanced rules. Readback must retain both effective
-values (known enum spelling is case-normalized; null is not `"None"`); the known
-optional `hostRules` and `rules` members must be absent, null, or empty arrays.
-Nonempty rules, malformed known fields, or any other default/inspection value
-fail closed. For this **non-isolating MVP only**, unknown top-level metadata
+There are no hostname or advanced rules in the request. Both its raw create
+response and an authenticated GET must independently satisfy the MVP predicate;
+SDK typed conversion or a later matching GET cannot excuse a create mismatch.
+The root legacy fields retain `Allow`/`None` (known spelling is case-normalized;
+null is not `"None"`), and root `hostRules`/`rules` must be absent, null, or empty
+arrays.
+
+The explicit compatibility predicate recognizes the official
+[`2026-09-01-preview` data-plane schema](https://github.com/Azure/azure-rest-api-specs/blob/799f241aaa07e2485e0b06cc8f6f3b3caefd29da/specification/app/data-plane/ContainerApps/models/sandboxes.tsp):
+
+| Readback field | Required MVP behavior |
+| --- | --- |
+| Root `enforcementMode` | Absent or exactly `Enforced`/`Audit`; null and unknown values fail. Both documented modes are accepted only because this profile claims no deny/rule enforcement boundary. |
+| `http` | Absent, or an object with explicit, case-exact `defaultAction: Allow` and `trafficInspection: None`. Neither field is inherited; omitted inspection is rejected because its documented default is Full. |
+| `http.hostRules` / `http.rules` | Absent or empty arrays only; null, malformed, or nonempty values fail. |
+| `http.enforcementMode` | Absent or exactly `Enforced`/`Audit`; if root and HTTP modes are both present, they must agree. Absence never synthesizes a mode. |
+| `http.defaultForward` / extra HTTP fields | Any presence fails, including null or empty values. No forwarding URL, CA data, or nested unknown semantics are accepted. |
+| Root `tds`, `transportRules`, `validationWarnings` | Any presence fails name-only, even empty. These documented sections are not ordinary metadata. |
+
+The SDK remains pinned to b4 / `2026-02-01-preview`; the newer schema is a
+classification reference, not an API upgrade or proof of cross-version alias
+precedence. Both flat and HTTP representations must satisfy their own checks.
+This predicate does not recover the omitted values from earlier sealed runs.
+
+Before policy assertions, a redacted observation records fixed-schema field
+presence, finite JSON types, array counts, and recognized enum literals only.
+It distinguishes absence from null and reports any accepted `Enforced`/`Audit`
+without calling it isolation. Unknown values, rules, headers, URLs, CA data,
+secret/MI references, credentials, and private runtime configuration are not
+traversed or logged. The observation is emitted as a warning before validation
+and returned under the deployment check's `egress.readback.observation`.
+Its `NOT EVALUATED` marker describes capture time, not the later validation result.
+Programmatic deployment can supply `egress_capture` to persist each policy-checked
+create/GET observation, including the fresh network precheck, synchronously before
+acceptance; capture failure blocks deployment.
+Logs alone are not a durable receipt: an authorized live driver must use a
+durable sink and separately capture transport/parser failures before a raw
+document is available. The pure `egress_policy_observation` helper is shared
+with that capture path; no consumed driver is modified or reused.
+
+Nonempty rules, malformed fields, or conflicting values fail closed.
+For this **non-isolating MVP only**, unknown top-level metadata
 fields do not block solely because their names are new: diagnostics report their
 sorted field names and count, never their values, and explicitly do not rely on
 their semantics. Conservative rule/policy/security-bearing names (such as names
 containing `rule`, `host`, `allow`, `deny`, `inspect`, `network`, `proxy`, `tls` or
 `certificate`) still fail with an actionable name-only diagnostic. Malformed or
-oversized names also fail without being echoed. This classification is not a
+oversized names also fail without being echoed. The fixed-schema observation
+contains only their count; separate name-only diagnostics retain the existing
+bounded field-name policy, never metadata values. This classification is not a
 complete service schema or a proof of unrestricted reachability. It does not
 change the blocked hardened mode's semantics.
 

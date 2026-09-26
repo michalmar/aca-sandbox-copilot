@@ -385,7 +385,7 @@ class AzurePolicyTests(unittest.TestCase):
             "destinationSet", "endpointMap", "networkIsolation", "egressDisabled", "proxyUrl", "TLSSettings",
             "certificateBundle", "securityOptions", "trustStore", "policyVersion", "caBundle", "CASettings",
             "portOverrides", "staticIP", "accessControl", "secretRef", "managedIdentityToken", "headers",
-            "managedIdentity", "transportConfig", "enforcementMode", "certBundle",
+            "managedIdentity", "transportConfig", "certBundle",
         )
         for name in names:
             for value in (None, [], "VALUE_CANARY", {"Authorization": "VALUE_CANARY"}):
@@ -410,7 +410,7 @@ class AzurePolicyTests(unittest.TestCase):
         for name in names:
             for value in (None, {"Authorization": "VALUE_CANARY"}):
                 with self.subTest(name=name, value=value):
-                    with self.assertNoLogs("hermes.egress", level="WARNING"), self.assertRaisesRegex(
+                    with self.assertLogs("hermes.egress", level="WARNING") as logged, self.assertRaisesRegex(
                         RuntimeError, "policy/security-bearing",
                     ) as raised:
                         common.validate_egress({"egressPolicy": {**self.egress, name: value}}, self.egress)
@@ -418,6 +418,8 @@ class AzurePolicyTests(unittest.TestCase):
                     self.assertIn("count=1", str(raised.exception))
                     self.assertNotIn("VALUE_CANARY", str(raised.exception))
                     self.assertNotIn("Authorization", str(raised.exception))
+                    self.assertNotIn("VALUE_CANARY", "\n".join(logged.output))
+                    self.assertNotIn("Authorization", "\n".join(logged.output))
 
     def test_acronym_plurals_do_not_lose_existing_short_word_boundaries(self):
         names = (
@@ -427,7 +429,7 @@ class AzurePolicyTests(unittest.TestCase):
         for name in names:
             for value in (None, {"Authorization": "VALUE_CANARY"}):
                 with self.subTest(name=name, value=value):
-                    with self.assertNoLogs("hermes.egress", level="WARNING"), self.assertRaisesRegex(
+                    with self.assertLogs("hermes.egress", level="WARNING") as logged, self.assertRaisesRegex(
                         RuntimeError, "policy/security-bearing",
                     ) as raised:
                         common.validate_egress({"egressPolicy": {**self.egress, name: value}}, self.egress)
@@ -435,6 +437,8 @@ class AzurePolicyTests(unittest.TestCase):
                     self.assertIn("count=1", str(raised.exception))
                     self.assertNotIn("VALUE_CANARY", str(raised.exception))
                     self.assertNotIn("Authorization", str(raised.exception))
+                    self.assertNotIn("VALUE_CANARY", "\n".join(logged.output))
+                    self.assertNotIn("Authorization", "\n".join(logged.output))
 
     def test_benign_metadata_and_substring_traps_are_not_security_fields(self):
         names = (
@@ -555,6 +559,242 @@ class AzurePolicyTests(unittest.TestCase):
             common.verify_mvp_network(sandbox, self.config)
         sandbox._dp_post.assert_not_called()
 
+    def test_network_precheck_captures_drift_before_rejection_and_guest_execution(self):
+        sandbox = MagicMock()
+        observations = []
+        raw = {"egressPolicy": {
+            **self.egress, "http": {"defaultAction": "Allow", "trafficInspection": "Full"},
+        }}
+        with patch.object(common, "raw_sandbox", return_value=raw), self.assertRaisesRegex(RuntimeError, "http"):
+            common.verify_mvp_network(sandbox, self.config, capture=observations.append)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["operation"], "get")
+        self.assertEqual(observations[0]["http"]["fields"]["trafficInspection"]["public_enum"], "Full")
+        self.assertEqual(observations[0]["validation"], "NOT EVALUATED")
+        sandbox._dp_post.assert_not_called()
+        sandbox._dp_put.assert_not_called()
+
+
+class SchemaEgressTests(unittest.TestCase):
+    def setUp(self):
+        self.egress = common.deployment_egress(config())
+
+    def policy(self, **changes):
+        return {**self.egress, "http": dict(self.egress), **changes}
+
+    def test_documented_enforcement_and_explicit_http_are_accepted(self):
+        policies = [self.egress, self.policy()]
+        for mode in ("Enforced", "Audit"):
+            policies.extend((
+                {**self.egress, "enforcementMode": mode},
+                self.policy(enforcementMode=mode),
+                self.policy(http={**self.egress, "enforcementMode": mode}),
+                self.policy(enforcementMode=mode, http={**self.egress, "enforcementMode": mode}),
+            ))
+        for policy in policies:
+            before = copy.deepcopy(policy)
+            with self.subTest(policy=policy):
+                result = common.validate_egress({"egressPolicy": policy}, self.egress)
+            self.assertTrue(result["known_fields_match"])
+            self.assertEqual(result["unrestricted_connectivity"], "NOT VERIFIED")
+            self.assertEqual(policy, before)
+
+    def test_enforcement_is_exact_optional_and_never_defaulted(self):
+        for value in (None, False, 0, [], {}, "", "enforced", "AUDIT", "Enforced ", "VALUE_CANARY"):
+            for location in ("root", "http"):
+                policy = self.policy()
+                target = policy if location == "root" else policy["http"]
+                target["enforcementMode"] = value
+                with self.subTest(location=location, value=value), self.assertRaisesRegex(
+                    RuntimeError, "enforcementMode",
+                ) as raised:
+                    common.validate_egress({"egressPolicy": policy}, self.egress)
+                self.assertNotIn("VALUE_CANARY", str(raised.exception))
+        result = common.validate_egress({"egressPolicy": self.policy()}, self.egress)
+        snapshot = result["observation"]
+        self.assertEqual(snapshot["enforcementMode"], {"present": False, "type": "absent"})
+        self.assertEqual(snapshot["http"]["fields"]["enforcementMode"], {"present": False, "type": "absent"})
+
+    def test_conflicting_enforcement_modes_reject_without_selecting_precedence(self):
+        for root_mode, http_mode in (("Enforced", "Audit"), ("Audit", "Enforced")):
+            with self.subTest(root_mode=root_mode), self.assertRaisesRegex(RuntimeError, "enforcementMode"):
+                common.validate_egress({"egressPolicy": self.policy(
+                    enforcementMode=root_mode, http={**self.egress, "enforcementMode": http_mode},
+                )}, self.egress)
+
+    def test_http_requires_an_object_and_both_explicit_case_exact_fields(self):
+        invalid = (None, [], "", False, 0, {}, {"defaultAction": "Allow"}, {"trafficInspection": "None"})
+        for http in invalid:
+            with self.subTest(http=http), self.assertRaisesRegex(RuntimeError, "http"):
+                common.validate_egress({"egressPolicy": self.policy(http=http)}, self.egress)
+        for key, values in (
+            ("defaultAction", ("Deny", "allow", "ALLOW", None, False, 0, "VALUE_CANARY")),
+            ("trafficInspection", ("Full", "Partial", "Legacy", "none", "NONE", None, False, 0, "VALUE_CANARY")),
+        ):
+            for value in values:
+                http = {**self.egress, key: value}
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(RuntimeError, "http") as raised:
+                    common.validate_egress({"egressPolicy": self.policy(http=http)}, self.egress)
+                self.assertNotIn("VALUE_CANARY", str(raised.exception))
+
+    def test_matching_http_does_not_override_incorrect_root_fields(self):
+        for key, value in (("defaultAction", "Deny"), ("trafficInspection", "Full")):
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, "raw egress policy"):
+                common.validate_egress({"egressPolicy": self.policy(**{key: value})}, self.egress)
+
+    def test_http_rule_lists_allow_only_absence_or_empty_arrays(self):
+        for key in ("hostRules", "rules"):
+            for value in (None, "", {}, False, 0, ["VALUE_CANARY"], [{"action": {"value": "VALUE_CANARY"}}]):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(RuntimeError, "http") as raised:
+                    common.validate_egress({"egressPolicy": self.policy(http={**self.egress, key: value})}, self.egress)
+                self.assertNotIn("VALUE_CANARY", str(raised.exception))
+        policy = self.policy(hostRules=None, rules=None, http={**self.egress, "hostRules": [], "rules": []})
+        result = common.validate_egress({"egressPolicy": policy}, self.egress)
+        snapshot = result["observation"]
+        self.assertEqual(snapshot["rules"], {"present": True, "type": "null"})
+        self.assertEqual(snapshot["http"]["fields"]["rules"], {"present": True, "type": "array", "count": 0})
+
+    def test_default_forward_any_presence_rejects_without_reading_its_contents(self):
+        class UnreadableProxy(dict):
+            def get(self, *args):
+                raise AssertionError("Forward proxy contents must not be read")
+
+            def items(self):
+                raise AssertionError("Forward proxy contents must not be traversed")
+
+        for value in (None, {}, [], False, "VALUE_CANARY", {"url": "https://VALUE_CANARY.invalid", "ca": "VALUE_CANARY"},
+                      UnreadableProxy({"url": "VALUE_CANARY"})):
+            snapshots = []
+            with self.subTest(kind=type(value).__name__), self.assertLogs(
+                "hermes.egress", level="WARNING",
+            ) as logged, self.assertRaisesRegex(RuntimeError, "defaultForward") as raised:
+                common.validate_egress({
+                    "egressPolicy": self.policy(http={**self.egress, "defaultForward": value}),
+                }, self.egress, capture=snapshots.append)
+            self.assertEqual(len(snapshots), 1)
+            field = snapshots[0]["http"]["fields"]["defaultForward"]
+            self.assertTrue(field["present"])
+            combined = json.dumps(snapshots) + "\n".join(logged.output) + str(raised.exception)
+            self.assertNotIn("VALUE_CANARY", combined)
+            self.assertNotIn('"url"', combined)
+            self.assertNotIn('"ca"', combined)
+
+    def test_documented_unsupported_sections_reject_even_empty(self):
+        for name in ("tds", "transportRules", "validationWarnings"):
+            for value in (None, {}, [], False, "VALUE_CANARY", {"credentials": "VALUE_CANARY"}):
+                snapshots = []
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(
+                    RuntimeError, "policy/security-bearing",
+                ) as raised:
+                    common.validate_egress({"egressPolicy": self.policy(**{name: value})},
+                                           self.egress, capture=snapshots.append)
+                self.assertIn(name, str(raised.exception))
+                self.assertTrue(snapshots[0][name]["present"])
+                self.assertNotIn("VALUE_CANARY", json.dumps(snapshots) + str(raised.exception))
+                self.assertNotIn("credentials", json.dumps(snapshots))
+
+    def test_http_extra_names_reject_without_recursing_and_root_metadata_remains_tolerated(self):
+        for name in ("futureRule", "metadata", "headers", "tds", "http", "proxy", "apiVersion"):
+            for value in (None, {}, {"Authorization": "VALUE_CANARY"}):
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(
+                    RuntimeError, "policy/security-bearing",
+                ) as raised:
+                    common.validate_egress({"egressPolicy": self.policy(http={**self.egress, name: value})}, self.egress)
+                self.assertIn(name, str(raised.exception))
+                self.assertNotIn("VALUE_CANARY", str(raised.exception))
+                self.assertNotIn("Authorization", str(raised.exception))
+        result = common.validate_egress({"egressPolicy": self.policy(metadata={"private": "VALUE_CANARY"})}, self.egress)
+        self.assertEqual(result["unknown_field_names"], ["metadata"])
+        self.assertNotIn("VALUE_CANARY", json.dumps(result))
+
+    def test_unsafe_or_oversized_http_names_fail_without_echoing(self):
+        for name in ("https://VALUE_CANARY.invalid", "VALUE_CANARY\n", "x" * 129, 1):
+            policy = self.policy(http={**self.egress, name: "VALUE_CANARY"})
+            with self.subTest(kind=type(name).__name__), self.assertLogs(
+                "hermes.egress", level="WARNING",
+            ) as logged, self.assertRaisesRegex(RuntimeError, "safe name-only") as raised:
+                common.validate_egress({"egressPolicy": policy}, self.egress)
+            self.assertNotIn("VALUE_CANARY", "\n".join(logged.output) + str(raised.exception))
+        with self.assertRaisesRegex(RuntimeError, "safe name-only"):
+            common.validate_egress({"egressPolicy": self.policy(http={
+                **self.egress, **{f"metadata_{index}": None for index in range(65)},
+            })}, self.egress)
+
+    def test_capture_distinguishes_absence_null_types_and_known_enums(self):
+        raw = {"egressPolicy": self.policy(
+            enforcementMode="Audit", hostRules=None, rules=[],
+            http={**self.egress, "enforcementMode": "Audit", "hostRules": []},
+        )}
+        snapshot = common.egress_policy_observation(raw, operation="create")
+        self.assertEqual(snapshot["operation"], "create")
+        self.assertEqual(snapshot["schema_api_version"], "2026-09-01-preview")
+        self.assertEqual(snapshot["schema_commit"], "799f241aaa07e2485e0b06cc8f6f3b3caefd29da")
+        self.assertEqual(snapshot["schema_model_sha256"],
+                         "79b33ac8c0546931584fb0d03bbe2338942feaeb9549b6f6602e5b2d05fafe37")
+        self.assertEqual(snapshot["validation"], "NOT EVALUATED")
+        self.assertFalse(snapshot["outbound_isolation"])
+        self.assertEqual(snapshot["enforcementMode"], {"present": True, "type": "string", "public_enum": "Audit"})
+        self.assertEqual(snapshot["hostRules"], {"present": True, "type": "null"})
+        self.assertEqual(snapshot["rules"], {"present": True, "type": "array", "count": 0})
+        self.assertEqual(snapshot["http"]["fields"]["rules"], {"present": False, "type": "absent"})
+        for document, present, kind in (({}, False, "absent"), ({"egressPolicy": None}, True, "null"),
+                                        ({"egressPolicy": []}, True, "array")):
+            with self.subTest(kind=kind):
+                value = common.egress_policy_observation(document)
+                self.assertEqual(value["policy"]["present"], present)
+                self.assertEqual(value["policy"]["type"], kind)
+
+    def test_capture_is_persisted_before_policy_rejection_or_invalid_expectation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+
+            def persist(observation):
+                with path.open("w", encoding="utf-8") as stream:
+                    json.dump(observation, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+            for expected in (self.egress, {**self.egress, "private": "VALUE_CANARY"}):
+                with self.subTest(expected_valid=expected == self.egress), self.assertRaises(RuntimeError):
+                    common.validate_egress({"egressPolicy": self.policy(enforcementMode="VALUE_CANARY")},
+                                           expected, operation="create", capture=persist)
+                snapshot = json.loads(path.read_text())
+                self.assertEqual(snapshot["operation"], "create")
+                self.assertEqual(snapshot["enforcementMode"], {"present": True, "type": "string"})
+                self.assertNotIn("VALUE_CANARY", path.read_text())
+                self.assertEqual(snapshot["validation"], "NOT EVALUATED")
+
+    def test_capture_failure_blocks_acceptance_and_does_not_echo_sink_errors(self):
+        for error in (OSError("VALUE_CANARY"), RuntimeError("VALUE_CANARY"), ValueError("VALUE_CANARY")):
+            sink = MagicMock(side_effect=error)
+            with self.subTest(kind=type(error).__name__), self.assertLogs(
+                "hermes.egress", level="WARNING",
+            ) as logged, self.assertRaisesRegex(RuntimeError, "capture") as raised:
+                common.validate_egress({"egressPolicy": self.policy()}, self.egress, capture=sink)
+            sink.assert_called_once()
+            self.assertNotIn("VALUE_CANARY", "\n".join(logged.output) + str(raised.exception))
+
+    def test_only_known_scalar_literals_and_bounded_shape_are_captured(self):
+        policy = self.policy(
+            defaultAction="VALUE_CANARY", enforcementMode="VALUE_CANARY",
+            hostRules=[{"pattern": "VALUE_CANARY"}],
+            rules=[{"headers": [{"Authorization": "VALUE_CANARY"}]}],
+            metadata={"private": "VALUE_CANARY"}, tds={"credentials": "VALUE_CANARY"},
+            validationWarnings=[{"code": "VALUE_CANARY", "message": "VALUE_CANARY"}],
+            http={"defaultAction": "Allow", "trafficInspection": "Full", "enforcementMode": "Audit",
+                  "defaultForward": {"url": "https://VALUE_CANARY.invalid", "ca": "VALUE_CANARY"},
+                  "rules": [{"hookRef": {"endpoint": "VALUE_CANARY", "authHeaders": [{"value": "VALUE_CANARY"}]}}]},
+        )
+        snapshot = common.egress_policy_observation({"egressPolicy": policy})
+        output = json.dumps(snapshot)
+        for private in ("VALUE_CANARY", "Authorization", "credentials", "hookRef", "endpoint", '"url"', '"ca"'):
+            self.assertNotIn(private, output)
+        self.assertNotIn("public_enum", snapshot["defaultAction"])
+        self.assertEqual(snapshot["http"]["fields"]["trafficInspection"]["public_enum"], "Full")
+        self.assertEqual(snapshot["rules"]["count"], 1)
+        self.assertEqual(snapshot["validationWarnings"]["count"], 1)
+        self.assertEqual(snapshot["unclassified_field_count"], 1)
+
 
 class EgressStatusAndAccessTests(unittest.TestCase):
     def setUp(self):
@@ -573,7 +813,11 @@ class EgressStatusAndAccessTests(unittest.TestCase):
         }
 
     def test_status_has_unrestricted_warning_and_no_false_hardened_or_live_success(self):
-        self.raw["egressPolicy"].update({"metadata": {"private": "VALUE_CANARY"}, "provisioningState": "VALUE_CANARY"})
+        self.raw["egressPolicy"].update({
+            "metadata": {"private": "VALUE_CANARY"}, "provisioningState": "VALUE_CANARY",
+            "enforcementMode": "Audit",
+            "http": {**common.deployment_egress(self.config), "enforcementMode": "Audit"},
+        })
         with (
             patch.object(test_hermes, "assert_owner"),
             patch.object(test_hermes, "owned_inventory", return_value=([], [], [object()])),
@@ -600,6 +844,10 @@ class EgressStatusAndAccessTests(unittest.TestCase):
         self.assertEqual(result["egress"]["readback"]["unknown_field_names"], ["metadata", "provisioningState"])
         self.assertEqual(result["egress"]["readback"]["unknown_field_count"], 2)
         self.assertEqual(result["egress"]["readback"]["unrestricted_connectivity"], "NOT VERIFIED")
+        observation = result["egress"]["readback"]["observation"]
+        self.assertEqual(observation["enforcementMode"]["public_enum"], "Audit")
+        self.assertEqual(observation["http"]["fields"]["enforcementMode"]["public_enum"], "Audit")
+        self.assertFalse(observation["outbound_isolation"])
         self.assertIn("exfiltrate personal data", result["egress"]["warning"])
         self.assertIn("NO outbound network isolation", "\n".join(logged.output))
         self.assertNotIn("VALUE_CANARY", json.dumps(result) + "\n".join(logged.output))
@@ -610,6 +858,8 @@ class EgressStatusAndAccessTests(unittest.TestCase):
 
     def test_access_warns_and_checks_policy_before_starting_the_fixed_loopback_relay(self):
         self.raw["egressPolicy"]["metadata"] = {"private": "VALUE_CANARY"}
+        self.raw["egressPolicy"]["http"] = common.deployment_egress(self.config)
+        self.raw["egressPolicy"]["enforcementMode"] = "Enforced"
         for valid in (False, True):
             raw = self.raw if valid else {**self.raw, "egressPolicy": {
                 "defaultAction": "Allow", "trafficInspection": "Full",
@@ -641,6 +891,23 @@ class EgressStatusAndAccessTests(unittest.TestCase):
                     run.assert_not_called()
                 azure.assert_called_once_with(self.config)
                 self.assertNotIn("VALUE_CANARY", "\n".join(logged.output))
+
+    def test_status_rejects_http_drift_before_runtime_key_or_dashboard_reads(self):
+        self.raw["egressPolicy"]["http"] = {"defaultAction": "Allow", "trafficInspection": "Full"}
+        with (
+            patch.object(test_hermes, "assert_owner"),
+            patch.object(test_hermes, "owned_inventory", return_value=([], [], [object()])),
+            patch.object(test_hermes, "get_sandbox", return_value=self.sandbox),
+            patch.object(test_hermes, "raw_sandbox", return_value=self.raw),
+            patch.object(test_hermes, "read_runtime") as runtime,
+            patch.object(test_hermes, "read_access_key") as key,
+            patch.object(test_hermes, "control_status") as status,
+            self.assertRaisesRegex(RuntimeError, "http"),
+        ):
+            test_hermes.inspect_deployment(self.config, self.clients)
+        runtime.assert_not_called()
+        key.assert_not_called()
+        status.assert_not_called()
 
 
 class PrivateUploadTests(unittest.TestCase):
@@ -793,7 +1060,9 @@ class DeploymentRollbackTests(unittest.TestCase):
         self.clients = MagicMock()
         self.clients.group._group_path = "/test/group"
         self.clients.group.list_sandboxes.return_value = []
-        self.clients.group._dp_put.return_value = {"id": "new-sandbox"}
+        self.clients.group._dp_put.return_value = {
+            "id": "new-sandbox", "egressPolicy": common.deployment_egress(self.config),
+        }
         self.sandbox = self.clients.group.get_sandbox_client.return_value
         self.sandbox.sandbox_id = "new-sandbox"
         self.sandbox._dp_post.return_value = {"exitCode": 0, "stdout": json.dumps({
@@ -903,6 +1172,64 @@ class DeploymentRollbackTests(unittest.TestCase):
         self.mocks["upload_private_file"].assert_not_called()
         self.clients.group.begin_delete_volume.assert_not_called()
 
+    def test_create_policy_is_validated_independently_before_get(self):
+        self.clients.group._dp_put.return_value["egressPolicy"] = {
+            **common.deployment_egress(self.config), "http": {"defaultAction": "Allow", "trafficInspection": "Full"},
+        }
+        with self.assertRaisesRegex(RuntimeError, "http"):
+            deploy_hermes.deploy(self.config, self.clients)
+        self.assert_rolled_back_without_data_deletion()
+        self.mocks["wait_running"].assert_not_called()
+        self.mocks["upload_private_file"].assert_not_called()
+
+    def test_create_and_get_snapshots_are_independent_and_precede_runtime_upload(self):
+        observations = []
+        mode = common.deployment_egress(self.config)
+        self.clients.group._dp_put.return_value["egressPolicy"] = {**mode, "enforcementMode": "Enforced", "http": mode}
+        self.mocks["wait_running"].return_value = {
+            **self.raw, "egressPolicy": {**mode, "http": {**mode, "trafficInspection": "Full"}},
+        }
+        with self.assertRaisesRegex(RuntimeError, "http"):
+            deploy_hermes.deploy(self.config, self.clients, egress_capture=observations.append)
+        self.assertEqual([item["operation"] for item in observations], ["create", "get"])
+        self.assertEqual(observations[0]["http"]["fields"]["trafficInspection"]["public_enum"], "None")
+        self.assertEqual(observations[1]["http"]["fields"]["trafficInspection"]["public_enum"], "Full")
+        self.assert_rolled_back_without_data_deletion()
+        self.mocks["upload_private_file"].assert_not_called()
+
+    def test_failed_capture_rolls_back_before_wait_upload_or_port(self):
+        sink = MagicMock(side_effect=OSError("VALUE_CANARY"))
+        with self.assertRaisesRegex(RuntimeError, "capture") as raised:
+            deploy_hermes.deploy(self.config, self.clients, egress_capture=sink)
+        self.assertNotIn("VALUE_CANARY", str(raised.exception))
+        self.assert_rolled_back_without_data_deletion()
+        self.mocks["wait_running"].assert_not_called()
+        self.mocks["upload_private_file"].assert_not_called()
+
+    def test_deploy_forwards_the_same_capture_sink_to_the_network_precheck(self):
+        sink = MagicMock()
+        self.assertEqual(deploy_hermes.deploy(self.config, self.clients, egress_capture=sink), "new-sandbox")
+        self.mocks["verify_mvp_network"].assert_called_once_with(self.sandbox, self.config, capture=sink)
+
+    def test_third_get_drift_is_captured_before_rollback_without_guest_execution(self):
+        self.mocks["verify_mvp_network"].side_effect = common.verify_mvp_network
+        self.sandbox._dp_get.return_value = {
+            **self.raw, "egressPolicy": {
+                **common.deployment_egress(self.config),
+                "http": {"defaultAction": "Allow", "trafficInspection": "Full"},
+            },
+        }
+        observations = []
+        with self.assertRaisesRegex(RuntimeError, "http"):
+            deploy_hermes.deploy(self.config, self.clients, egress_capture=observations.append)
+        self.assertEqual([item["operation"] for item in observations], ["create", "get", "get"])
+        self.assertEqual(observations[0]["trafficInspection"]["public_enum"], "None")
+        self.assertEqual(observations[1]["trafficInspection"]["public_enum"], "None")
+        self.assertEqual(observations[2]["http"]["fields"]["trafficInspection"]["public_enum"], "Full")
+        self.assert_rolled_back_without_data_deletion()
+        self.sandbox._dp_post.assert_not_called()
+        self.mocks["control_status"].assert_not_called()
+
     def test_unexpected_status_shape_rolls_back(self):
         self.mocks["control_status"].return_value = {}
         with self.assertRaises(KeyError):
@@ -916,7 +1243,7 @@ class DeploymentRollbackTests(unittest.TestCase):
         self.assert_rolled_back_without_data_deletion()
 
     def test_missing_create_id_recovers_only_the_matching_new_image(self):
-        self.clients.group._dp_put.return_value = {}
+        self.clients.group._dp_put.return_value = {"egressPolicy": common.deployment_egress(self.config)}
         self.clients.group.list_sandboxes.side_effect = [[], [SimpleNamespace(id="new-sandbox")], []]
         with self.assertRaisesRegex(RuntimeError, "no valid ID"):
             deploy_hermes.deploy(self.config, self.clients)
@@ -1058,7 +1385,7 @@ class OrderedDeploymentTests(unittest.TestCase):
             "wait_running": lambda sandbox: sandbox._dp_get(sandbox._sbx_path),
             "upload_private_file": lambda *args, **kwargs: self.events.append("upload-runtime"),
             "read_runtime": lambda *args: common.runtime_document(self.config),
-            "verify_mvp_network": lambda *args: None,
+            "verify_mvp_network": lambda *args, **kwargs: None,
             "configure_port": lambda *args: self.events.append("open-port"),
         }
         self.mocks = {}
@@ -1169,7 +1496,7 @@ class OrderedDeploymentTests(unittest.TestCase):
         self.gateway_running["new-sandbox"] = self.desired == "running" and self.paired
         if self.gateway_running["new-sandbox"]:
             self.events.append("boot-gateway:new-sandbox")
-        return {"id": "new-sandbox"}
+        return {"id": "new-sandbox", "egressPolicy": copy.deepcopy(payload["egressPolicy"])}
 
     def test_replace_orders_image_stop_delete_empty_check_create_reconfigure_and_port(self):
         self.assertEqual(deploy_hermes.deploy(self.config, self.clients, replace=True), "new-sandbox")
