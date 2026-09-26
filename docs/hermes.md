@@ -74,7 +74,8 @@ with that capture path; no consumed driver is modified or reused.
 ### Optional durable status evidence
 
 An authorized runner can share one `hermes_common.StatusRecorder(persist_event)`
-between `validate_egress(..., status_capture=recorder)` for its pre-status policy
+between `deploy(..., fresh=True, status_capture=recorder)`,
+`validate_egress(..., status_capture=recorder)` for its pre-status policy
 check and `test_hermes.inspect_deployment(..., capture=recorder, network=True)`.
 The existing deployment `egress_capture` callback remains separate. Neither
 default CLI output nor a call without a sink produces durable status evidence.
@@ -366,13 +367,84 @@ Only after separately approving the cloud scope and deliberately setting
 `HERMES_EGRESS_MODE=allow-all-mvp`, use the exact-target interface:
 
 ```console
-python scripts/deploy_hermes.py --confirm-target "<full-hermes-group-resource-id>"
+python scripts/deploy_hermes.py --fresh --confirm-target "<full-hermes-group-resource-id>"
 python scripts/deploy_hermes.py --replace --confirm-target "<full-hermes-group-resource-id>"
 ```
 
 Both paths print the unrestricted-egress warning. Missing or unverified modes
 still refuse before configuration/Azure access, including `--replace`. Neither
 command assigns roles, provisions a model, or publishes an image.
+
+`--fresh` is explicit first-deployment-only behavior: after the existing owner
+and ARM ownership checks, the production `provision_group` boundary requires
+three consecutive complete, empty SDK inventory rounds. Each round consumes
+volumes, sandboxes, disk images, then secrets, using the **same** configured
+`AzureClients`, credential, group SDK object, pipeline, and transport/session.
+Response envelopes match the pinned SDK per operation: volumes, sandboxes,
+and disk images require a `value` list or a bare array; secrets require a
+`secrets` list in an object, never an inferred empty list from a missing key.
+Secrets pagination uses the same checked `nextLink` contract. No secret
+metadata or values are retained. Unknown response shapes fail closed.
+Rounds are at least ten seconds apart; there is no sleep after the third pass.
+The readiness deadline is 900 seconds. Each complete SDK list read, including
+all its pages, has a ten-second budget capped by the remaining deadline;
+connection/read timeouts divide that budget without lengthening a smaller
+configured timeout. Cyclic pagination is rejected before another read. No
+success is accepted after the deadline. These are bounded SDK/network timeout
+budgets, not a hard real-time guarantee about OS scheduling or a blocking sink.
+
+HTTP 401/403 records `permission`, resets the streak, and permits only another
+bounded read-only round. It is not evidence that role propagation is the cause.
+Other transport, parser, unexpected HTTP status, malformed/unfinished list,
+nonempty inventory, or ownership failures stop immediately. SDK 0.1.0b4 drops
+timeout keyword arguments on list methods, so the helper temporarily wraps
+the existing transport's `send` method for these synchronous reads. It enforces
+the exact read target, records safe response status/counts, and surfaces denials
+before SDK retries can hide them. The wrapper is restored on every exit; no
+credential, client, session, token cache, or SDK retry configuration is replaced
+or changed. Do not concurrently use this same client during the synchronous gate.
+
+The original, single `list_volumes` boundary is then checked immediately with
+operation `hermes.status.v1.provision.volumes.list`. A 403 on that read is still failure,
+recorded as `permission` before the existing `RuntimeError` conversion, not a
+reason to retry deployment. A finite readiness streak is not an authorization
+guarantee. No PUT, image/sandbox creation, or whole deployment is retried by this
+helper, and role scopes and all egress/ingress/rollback gates remain unchanged.
+
+**The ordinary CLI retains the SDK's existing retry policy outside these
+wrapped readiness reads.** That default includes retries for 403 and can
+repeat later GET/PUT/DELETE requests; `--fresh` does not change it. Consequently,
+the CLI is **not suitable for an authorized single-attempt live run** whose
+contract forbids mutation retries. Its authorized driver must construct and
+verify the original ARM/group clients with `retry_total=0` before calling
+`deploy(..., fresh=True)`, as required by that run's frozen contract. The
+readiness helper neither changes retry configuration nor replaces those
+objects. Later unwrapped 403s fail immediately only with that no-retry client
+configuration; they must never trigger a replay of `deploy` or resource creation.
+
+Authorized drivers call `deploy(config, clients, fresh=True,
+status_capture=recorder, egress_capture=policy_sink)` instead of duplicating an
+external readiness loop. The recorder must have a synchronous durable sink;
+CLI output alone is not evidence. The closed `readiness.*` operation catalog
+records round indexes 1 through 3, streak reset/pass, safe completion counts,
+last-page response type, required-items-key presence and item-container type,
+elapsed milliseconds, and finite error categories, never credentials, claims,
+headers, URLs, IDs, private values, or exception text. A supplied sink failure
+stops before further reads or creation.
+
+Fresh mode refuses existing data and cannot be combined with `--replace`.
+The deployment's existing inventory read immediately afterward must still be
+empty (`provision.fresh-inventory`); newly appearing resources are not adopted
+as an idempotent deployment or reused as a recovery disk. This reuses existing
+reads, forwards the same recorder through the existing `inventory.*` operations
+so a subsequent permission failure has its exact operation, and is not an
+atomic exclusion of concurrent owner mutations.
+Omit `--fresh` for unchanged existing-deployment checks or recovery using a
+preserved DataDisk; those paths do not wait for empty inventory. A readiness
+failure precedes data-plane creation. The authorized live runner remains
+responsible for its separately approved cleanup of newly created ARM resources
+and role assignments. No historical deployment failure is attributed to a
+specific propagation, token, or service cause by this contract.
 
 Replacement preserves the same DataDisk, waits for the old writer to disappear,
 uploads and verifies the nonsecret runtime atomically, applies controlled

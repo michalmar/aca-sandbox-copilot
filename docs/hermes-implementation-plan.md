@@ -6,16 +6,19 @@ a C 10/10. Dočasná B8 změna pro MVP egress byla samostatně přijata
 v review 9,2 -> 9,9/10 a přesný finální zdroj ještě v neskórovaném
 uzavření bez blockerů. B9 kompatibilita s novou HTTP egress schema
 byla přijata 9,6 -> 9,9/10. B11 bezpečná status/inventory diagnostika
-byla přijata 9,7 -> 9,9/10.
+byla přijata 9,7 -> 9,9/10. B13 sustained readiness byla po opravě
+skutečné SDK envelope vady přijata 7,7 -> 9,5/10.
 U A nezůstávají opravitelné nálezy; zbývající odpočet je za přiznanou
 strukturální složitost, nikoli neopravené vady. Přesné lokální image
 a jejich integrační brány prošly. Všech 50 implementačních souborů bylo
 předáno do hlavního checkoutu a znovu ověřeno včetně celé hostitelské sady.
-Dva skutečné MVP deploy pokusy byly bezpečně ukončeny a plně uklizeny.
+Tři skutečné MVP deploy pokusy byly bezpečně ukončeny a plně uklizeny.
 B9 odstranil první policy-schema blocker a druhý pokus živě prokázal
 root/HTTP `Allow + None + Enforced`; zastavil se však v následné status
 cestě bez dostatečně přesného checkpointu. B11 přidává diagnostiku této
-cesty. Třetí cloudový pokus zůstává BLOCKED na samostatném schválení.
+cesty. Třetí pokus odhalil nestabilní data-plane readiness: jeden
+úspěšný průchod následoval za 4,5 s HTTP 403. B13 zpřísňuje fresh
+readiness. Čtvrtý cloudový pokus zůstává BLOCKED na samostatném schválení.
 Souhlasy a výsledky jsou v §11; další pokus není automaticky povolený.
 Datum: 2026-09-26.
 
@@ -892,6 +895,44 @@ validator return a pokrývá skutečnou ownership/inventory/selection/raw
 GET cestu bez dalších requestů, guest příkazů nebo změny fail-closed
 pravidel. Další live pokus vyžaduje nový driver a nový souhlas.
 
+Uživatel následně výslovně schválil třetí skutečný pokus a požadoval
+nepřerušované provedení až do významného selhání nebo finálního
+výsledku. Run `7430eaa1-be7c-4d9e-a948-dd78e5501f49` znovu ověřil
+vyhrazený Azure profil, cíl, image, Foundry a role. RG/group a správné
+owner/group-MI role vznikly a byly přečteny. Externí readiness kontrola
+se stejným credential objektem, klientem, pipeline a SDK `list_volumes`
+uspěla na druhém bounded GET-only průchodu. Přibližně 4,504 s poté však
+první guarded data-plane GET uvnitř reviewovaného `provision_group`
+vrátil HTTP 403. Selhání nastalo před DataDiskem, image importem,
+sandboxem, portem i B9/B11 runtime branami.
+
+Cleanup odstranil role, group a RG; nový samostatný proces potvrdil
+RG/group/obě assignment ID jako 404. Read-only analýza prokázala, že
+readiness a deploy používaly stejný objekt klienta, credential, session
+i `list_volumes`; neprokázala příčinu. AzureCliCredential sám nemá
+aplikační cache, ale azure-core a CLI mají vlastní tokenové/cache vrstvy;
+jejich obsah nebyl čten a žádná hypotéza nebyla označena za root cause.
+
+B13 přesouvá readiness do produkčního fresh boundary. Explicitní
+`deploy(..., fresh=True)` vyžaduje tři kompletní po sobě jdoucí prázdné
+inventory roundy alespoň 10 sekund od sebe během nejvýše 900 sekund,
+se stejnými původními klienty a transportem. 401/403 streak resetuje;
+ostatní HTTP, transport, parser, shape, ownership, nonempty, timeout
+nebo capture chyby zůstávají terminální. Po třetím roundu následuje
+okamžitě původní `list_volumes`; žádný PUT, import, create ani celý
+deploy se neopakuje.
+
+Každý round ověřuje skutečné SDK envelope pro volumes, sandboxes,
+disk images a secrets. Review odhalilo, že `list_secrets` používá
+objektové pole `secrets`, zatímco ostatní operace používají `value`
+nebo array; původní fixture tuto vadu maskoval. B13 používá přesné
+operation-specific klíče, path-sensitive fixtures, bezpečné readiness
+events a odmítá malformed, nonempty i cyklickou pagination. Běžný CLI
+zachovává SDK retry a není vhodný pro one-shot live driver; budoucí
+driver musí vytvořit a ověřit původní ARM/group klienty s
+`retry_total=0`. Tři roundy nejsou garance propagace; pozdější 403
+stále znamená cleanup.
+
 Pro plán a lokální implementaci nejsou potřeba tajné hodnoty. Až bude
 implementace připravená, uživatel bezpečnou lokální konfigurací dodá:
 
@@ -929,7 +970,7 @@ příslušných session.
 | Proud | Dosavadní skóre Opus 5.5 | Stav |
 | --- | --- | --- |
 | A: runtime a WhatsApp | 6,2 -> 7,8 -> 8,0; náhradní kritik 9,15 -> 9,60/10 | Finální A6 přijata bez opravitelných nálezů či vad důkazů. Opravené lifecycle/RPC, skutečný bridge, pre-tool `@reference` I/O a přísný dependency graph. Prošly přesné image, 121 nativních Python a 12 Node testů, skutečný entrypoint a browser scénáře. Zbývající odpočet je za strukturální patchování upstreamu, dvě schválené výjimky a zdokumentované provozní limity; není důvod vyrábět další nezměněná review nebo tvrdit 10/10. |
-| B: Azure a přístup | B7: 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10; B8 MVP: 9,2 -> 9,9/10 + neskórované ACCEPT; B9 schema: 9,6 -> 9,9/10; B11 status: 9,7 -> 9,9/10 ACCEPT | B7 zůstává historicky schválený hardened základ. B8 zavedl explicitní `allow-all-mvp`; B9 fixed-schema policy ověření. Po druhém plně uklizeném live blockeru B11 přidává 46 operation ID a durable bezpečnou status/inventory diagnostiku bez nových requestů nebo změny validačních pravidel. Změnil čtyři host-side soubory; runtime/image/C/workflow/dependency bytes zůstaly identické. Skóre není schválení třetího live pokusu. |
+| B: Azure a přístup | B7: 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10; B8 MVP: 9,2 -> 9,9/10 + neskórované ACCEPT; B9 schema: 9,6 -> 9,9/10; B11 status: 9,7 -> 9,9/10; B13 readiness: 7,7 -> 9,5/10 ACCEPT | B7 zůstává historicky schválený hardened základ. B8 zavedl explicitní `allow-all-mvp`, B9 fixed-schema policy a B11 durable status/inventory diagnostiku. Po třetím plně uklizeném same-client 403 blockeru B13 přidává explicitní fresh-only tříroundovou readiness, přesné SDK envelopes a retry-zero driver povinnost bez mutation retry. Změnil/přidal pět host-side souborů; runtime/image/C/workflow/dependency bytes zůstaly identické. Skóre není schválení čtvrtého live pokusu. |
 | C: Google read-only | 8,6 -> 9,8 -> 10/10; samostatná integrační revize C4 znovu 10/10 | Předaný C4 patch je nezávisle zreviewovaný, 104 lokálních testů prošlo. Nativní timing/cancellation a fake-bridge WhatsApp tools jsou další offline integrační důkazy. Osobní OAuth/P9/soak tím neprošly. |
 
 Žádný z těchto výsledků neodstraňuje blokaci produkčního deploye ani
@@ -957,16 +998,19 @@ Po schema výzkumu byl aplikován reviewovaný B9 delta patch, SHA-256
 Po druhém plně uklizeném pokusu byl aplikován reviewovaný B11 delta
 patch, SHA-256
 `03b841a4d50ffae24b946d996a2930400ef43c2d16420e5b8b541a36728c2576`.
+Po třetím plně uklizeném pokusu byl aplikován reviewovaný B13 delta
+patch, SHA-256
+`dd4e93350938f330711b498dd306a67920496f83d06f59a3320f6024435595b9`.
 Všech 50 souborů včetně executable bitů odpovídá finálnímu manifestu;
 tento plán je samostatný doprovodný dokument. Původní Copilot implementace
 zůstala beze změny, kromě odkazu v README a dvou pravidel `.gitignore`.
 Nevznikl commit, push, PR ani publikace image.
 
-Finální B11 replay před předáním: B sada **233 celkem / 219 prošlo /
-14 image-only přeskočeno**, úplná host sada **465 / 398 / 67** a přesná
-existující SDK image **228 / 228 / 0** (původních 52 bran plus 176
-policy/lifecycle/status kontraktů). Všech 27 status evidence testů
-prošlo na hostu i v SDK image. Přesná množina 67 přeskočených ID
+Finální B13 replay před předáním: B sada **271 celkem / 257 prošlo /
+14 image-only přeskočeno**, úplná host sada **503 / 436 / 67** a přesná
+existující SDK image **266 / 266 / 0** (původních 52 bran plus 214
+policy/lifecycle/status/readiness kontraktů). Všech 38 readiness testů
+prošlo na host tier i v SDK image. Přesná množina 67 přeskočených ID
 i důvodů odpovídá A6 image-covered sadě. Runtime/image vstupy se
 nezměnily, proto se image znovu nestavěly.
 

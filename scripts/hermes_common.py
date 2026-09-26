@@ -410,7 +410,10 @@ STATUS_OPERATION_IDS = frozenset(_STATUS_PREFIX + name for name in (
         "inventory.images.check", "inventory.volumes.check", "inventory.volumes.count",
         "selection.sandbox", "selection.client", "status.lifecycle", "status.ports",
         "status.runtime", "status.access-key", "status.control", "network.https",
+        "provision.volumes.list", "provision.fresh-inventory",
+        "readiness.wait", "readiness.round", "readiness.spacing", "readiness.reset",
     }
+    | {f"readiness.{kind}.list" for kind in ("volumes", "sandboxes", "images", "secrets")}
     | {f"{scope}.policy.{step}" for scope in ("precheck", "status", "network") for step in ("capture", "validate")}
     | {f"{scope}.raw.{step}" for scope in ("status", "network") for step in ("get", "match")}
     | {
@@ -425,7 +428,7 @@ STATUS_ERROR_CATEGORIES = frozenset({
     "volume_type_mismatch", "volume_size_mismatch", "transport", "service_error", "capture_persistence",
     "interrupted", "policy_mismatch", "mode_mismatch", "resource_mismatch", "lifecycle_mismatch",
     "ingress_mismatch", "runtime_mismatch", "private_key_shape", "runtime_status", "guest_exec",
-    "network_tls", "unexpected",
+    "network_tls", "unexpected", "readiness_timeout",
 })
 _STATUS_FIELDS = frozenset({
     "snapshot", "capture_committed", "validator_returned", "capture_supplied",
@@ -441,6 +444,9 @@ _STATUS_FIELDS = frozenset({
     "size_present", "size_type", "size_matches", "size_tag", "config_mode_matches", "token_acquired",
     "claims_type", "tenant_matches", "owner_matches", "user_type_matches", "audience_matches",
     "runtime_matches", "key_checked", "control_checked", "connected_hosts_count",
+    "round_index", "consecutive_rounds", "reads_completed", "pages_completed", "elapsed_ms",
+    "http_status", "authorization_guaranteed", "spacing_met", "request_matches",
+    "items_key_present", "items_type",
 }) | _EGRESS_ROOT_FIELDS | _EGRESS_BLOCKED_FIELDS
 _STATUS_LITERALS = frozenset({
     "absent", "null", "boolean", "string", "object", "array", "number", "unsupported", "iterable",
@@ -480,11 +486,18 @@ class StatusCaptureError(RuntimeError):
         self.prior_error_category = prior_error_category
 
 
+class ReadinessTimeoutError(TimeoutError):
+    def __init__(self):
+        super().__init__("Fresh-group readiness exceeded its bounded deadline; no data-plane creation was attempted.")
+
+
 def _status_error_category(error: BaseException, fallback: str) -> str:
     if isinstance(error, StatusCaptureError):
         return "capture_persistence"
     if isinstance(error, (KeyboardInterrupt, SystemExit, CancelledError)):
         return "interrupted"
+    if isinstance(error, ReadinessTimeoutError):
+        return "readiness_timeout"
     if fallback == "capture_persistence":
         return fallback
     if isinstance(error, ResourceNotFoundError):

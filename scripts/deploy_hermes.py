@@ -6,26 +6,245 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
-from azure.core.exceptions import AzureError, HttpResponseError, ResourceNotFoundError
+from azure.core.exceptions import AzureError, ClientAuthenticationError, HttpResponseError, ResourceNotFoundError
 
 from hermes_common import (
-    AzureClients, Config, CONTROL, GatewayHandoff, RUNTIME_PATH, assert_group_owned, assert_labels,
+    AzureClients, Config, CONTROL, GatewayHandoff, RUNTIME_PATH, ReadinessTimeoutError, StatusRecorder, StatusSink,
+    _egress_value_type, _status_error_category, _status_list, assert_group_owned, assert_labels,
     assert_no_suspend, assert_owner, configure_port, confirm_target, control_status,
-    delete_sandbox_confirmed, deployment_egress, exec_checked, load_egress_config, owned_inventory,
+    delete_sandbox_confirmed, deployment_egress, endpoint_for_region, exec_checked, load_egress_config, owned_inventory,
     quiesce_gateway, raw_sandbox, read_control_status, read_runtime,
     runtime_document, sandbox_document, upload_private_file, validate_egress,
     validate_ports, verify_mvp_network, wait_running, warn_unrestricted_egress,
 )
 
 LOG = logging.getLogger("hermes.deploy")
+_READINESS_SECONDS = 900
+_READINESS_SPACING = 10
+_READINESS_READ_SECONDS = 10
+_READINESS_ROUNDS = 3
+_READINESS_READS = (
+    ("volumes", "list_volumes", "/volumes", "value"),
+    ("sandboxes", "list_sandboxes", "/sandboxes", "value"),
+    ("images", "list_disk_images", "/diskimages", "value"),
+    ("secrets", "list_secrets", "/secrets", "secrets"),
+)
 
 
-def provision_group(config: Config, clients: AzureClients) -> None:
+def _readiness_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReadinessTimeoutError()
+    return remaining
+
+
+@contextmanager
+def _readiness_transport(config: Config, clients: AzureClients, suffix: str, items_key: str, deadline: float, step):
+    group = clients.group
+    expected_path = (
+        f"/subscriptions/{config.subscription_id}/resourceGroups/{config.resource_group}"
+        f"/sandboxGroups/{config.sandbox_group}{suffix}"
+    )
+    expected_endpoint = urlsplit(endpoint_for_region(config.location))
+    if (
+        group._credential is not clients.credential
+        or group.subscription_id != config.subscription_id
+        or group.resource_group != config.resource_group
+        or group.sandbox_group != config.sandbox_group
+    ):
+        step.error_category = "resource_mismatch"
+        raise RuntimeError("Fresh readiness requires the configured group's existing owner client.")
+    transport = group._pipeline._transport
+    original = transport.send
+    had_override = "send" in vars(transport)
+    previous = vars(transport).get("send")
+    seen = set()
+
+    def matches_read_url(value):
+        try:
+            target = urlsplit(value)
+            return (
+                target.scheme == expected_endpoint.scheme and target.netloc == expected_endpoint.netloc
+                and target.path == expected_path
+                and parse_qs(target.query).get("api-version") == ["2026-02-01-preview"]
+                and not target.fragment
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def send(request, **options):
+        _readiness_remaining(deadline)
+        for field in ("http_status", "response_type", "items_key_present", "items_type"):
+            step.details.pop(field, None)
+        step.details["request_matches"] = request.method == "GET" and matches_read_url(request.url)
+        if not step.details["request_matches"]:
+            step.error_category = "resource_mismatch"
+            raise RuntimeError("Fresh readiness attempted a request outside its exact read boundary.")
+        if request.url in seen:
+            step.error_category = "malformed_type"
+            raise RuntimeError("Fresh readiness returned cyclic pagination.")
+        seen.add(request.url)
+        started = time.monotonic()
+        budget = min(_READINESS_READ_SECONDS, _readiness_remaining(deadline))
+        limit = budget / 2
+        connection = getattr(transport, "connection_config", None)
+        for key, attribute in (("connection_timeout", "timeout"), ("read_timeout", "read_timeout")):
+            configured = options.get(key, getattr(connection, attribute, _READINESS_READ_SECONDS))
+            if type(configured) not in (int, float) or not math.isfinite(configured) or configured <= 0:
+                step.error_category = "malformed_type"
+                raise RuntimeError("Fresh readiness requires finite positive transport timeouts.")
+            options[key] = min(configured, limit)
+        try:
+            response = original(request, **options)
+        except (AzureError, OSError, ValueError, TypeError) as error:
+            step.error_category = _status_error_category(error, "transport")
+            raise RuntimeError("Fresh readiness transport failed; details suppressed.") from None
+        _readiness_remaining(deadline)
+        if time.monotonic() - started >= budget:
+            raise ReadinessTimeoutError()
+        code = response.status_code
+        if type(code) is not int or not 100 <= code <= 599:
+            step.error_category = "malformed_type"
+            raise RuntimeError("Fresh readiness returned an invalid HTTP status.")
+        step.details["http_status"] = code
+        if code in (401, 403):
+            # Surface denial before the SDK's existing retry/auth policies can hide it.
+            denied = ClientAuthenticationError("Fresh readiness was denied.")
+            denied.status_code = code
+            raise denied
+        if code != 200:
+            step.error_category = "notfound" if code == 404 else "service_error"
+            raise RuntimeError("Fresh readiness did not return HTTP 200.")
+        try:
+            raw = response.json()
+        except (AzureError, ValueError, TypeError):
+            step.error_category = "parser"
+            raise RuntimeError("Fresh readiness returned invalid JSON; details suppressed.") from None
+        present = isinstance(raw, dict) and items_key in raw
+        step.details.update({
+            "response_type": _egress_value_type(raw), "items_key_present": present,
+            "items_type": _egress_value_type(raw[items_key]) if present else "absent",
+        })
+        if isinstance(raw, dict) and isinstance(raw.get(items_key), list):
+            values = raw[items_key]
+            if raw.get("nextLink") is not None and not isinstance(raw["nextLink"], str):
+                step.error_category = "malformed_type"
+                raise RuntimeError("Fresh readiness returned malformed pagination.")
+            if raw.get("nextLink") and not matches_read_url(raw["nextLink"]):
+                step.error_category = "resource_mismatch"
+                raise RuntimeError("Fresh readiness pagination leaves its exact read boundary.")
+            if raw.get("nextLink") in seen:
+                step.error_category = "malformed_type"
+                raise RuntimeError("Fresh readiness returned cyclic pagination.")
+        elif items_key == "value" and isinstance(raw, list):
+            values = raw
+        else:
+            step.error_category = "malformed_type"
+            raise RuntimeError("Fresh readiness returned a malformed list envelope.")
+        step.details["count"] += len(values)
+        if values:
+            step.error_category = "inventory_count"
+            raise RuntimeError("Fresh deployment requires an empty owned group; existing data was not changed.")
+        step.details["pages_completed"] += 1
+        return response
+
+    # SDK 0.1.0b4 list methods discard timeout kwargs. Scope the existing transport,
+    # not a replacement client/session or changed SDK retry configuration.
+    transport.send = send
+    try:
+        yield
+    finally:
+        if had_override:
+            transport.send = previous
+        else:
+            del transport.send
+
+
+def _readiness_list(
+    config: Config, clients: AzureClients, trace: StatusRecorder, deadline: float,
+    kind: str, method: str, suffix: str, items_key: str, round_index: int, *, operation: str | None = None,
+) -> None:
+    deadline = min(deadline, time.monotonic() + _READINESS_READ_SECONDS)
+    with trace.step(operation or f"readiness.{kind}.list", details={
+        "round_index": round_index, "count": 0, "pages_completed": 0, "complete": False,
+    }) as step:
+        _readiness_remaining(deadline)
+        with _readiness_transport(config, clients, suffix, items_key, deadline, step):
+            source = getattr(clients.group, method)()
+            if source is None or isinstance(source, (str, bytes, dict)):
+                step.error_category = "malformed_type"
+                raise RuntimeError("Fresh readiness did not return an SDK list iterator.")
+            for _ in source:
+                step.error_category = "inventory_count"
+                raise RuntimeError("Fresh readiness returned a nonempty SDK inventory.")
+        _readiness_remaining(deadline)
+        if not step.details["pages_completed"]:
+            step.error_category = "malformed_type"
+            raise RuntimeError("Fresh readiness completed without an observed SDK response.")
+        step.details["complete"] = True
+
+
+def _wait_fresh_group_ready(config: Config, clients: AzureClients, trace: StatusRecorder) -> float:
+    started = time.monotonic()
+    deadline = started + _READINESS_SECONDS
+    consecutive = 0
+    last_finished = None
+    with trace.step("readiness.wait", details={
+        "consecutive_rounds": 0, "elapsed_ms": 0, "authorization_guaranteed": False,
+    }) as waiting:
+        while consecutive < _READINESS_ROUNDS:
+            if last_finished is not None:
+                with trace.step("readiness.spacing", details={"spacing_met": False}) as spacing:
+                    delay = max(0, last_finished + _READINESS_SPACING - time.monotonic())
+                    if delay >= _readiness_remaining(deadline):
+                        raise ReadinessTimeoutError()
+                    if delay:
+                        time.sleep(delay)
+                    _readiness_remaining(deadline)
+                    spacing.details["spacing_met"] = time.monotonic() - last_finished >= _READINESS_SPACING
+                    if not spacing.details["spacing_met"]:
+                        raise RuntimeError("Fresh readiness spacing was interrupted.")
+            _readiness_remaining(deadline)
+            round_index = consecutive + 1
+            try:
+                with trace.step("readiness.round", details={
+                    "round_index": round_index, "reads_completed": 0, "complete": False,
+                }) as round_step:
+                    for kind, method, suffix, items_key in _READINESS_READS:
+                        _readiness_list(config, clients, trace, deadline, kind, method, suffix, items_key, round_index)
+                        round_step.details["reads_completed"] += 1
+                    _readiness_remaining(deadline)
+                    round_step.details["complete"] = True
+            except HttpResponseError as error:
+                if error.status_code not in (401, 403):
+                    raise
+                with trace.step("readiness.reset", details={
+                    "round_index": round_index, "http_status": error.status_code,
+                    "consecutive_rounds": 0, "authorization_guaranteed": False,
+                }):
+                    consecutive = 0
+            else:
+                consecutive += 1
+            last_finished = time.monotonic()
+            waiting.details.update({
+                "consecutive_rounds": consecutive, "elapsed_ms": int((last_finished - started) * 1000),
+            })
+        _readiness_remaining(deadline)
+    return deadline
+
+
+def provision_group(
+    config: Config, clients: AzureClients, *, fresh: bool = False, status_capture: StatusSink = None,
+) -> None:
+    trace = StatusRecorder.coerce(status_capture)
     if clients.resources.resource_groups.check_existence(config.resource_group):
         rg = clients.resources.resource_groups.get(config.resource_group)
         assert_labels(rg.tags, config, "resource group")
@@ -50,8 +269,15 @@ def provision_group(config: Config, clients: AzureClients) -> None:
     if not isinstance(identity, dict) or identity.get("type") != "SystemAssigned" or not identity.get("principalId"):
         raise RuntimeError("Hermes requires the new Sandbox Group's system-assigned managed identity.")
     assert_group_owned(config, clients)
+    deadline = _wait_fresh_group_ready(config, clients, trace) if fresh else None
     try:
-        list(clients.group.list_volumes())
+        if deadline is not None:
+            _readiness_list(
+                config, clients, trace, deadline, *_READINESS_READS[0], _READINESS_ROUNDS,
+                operation="provision.volumes.list",
+            )
+        else:
+            _status_list(trace, "provision.volumes.list", clients.group.list_volumes)
     except HttpResponseError as error:
         if error.status_code == 403:
             raise RuntimeError(
@@ -167,17 +393,27 @@ def report_gateway_state(status: dict) -> None:
 
 
 def deploy(
-    config: Config, clients: AzureClients, *, replace: bool = False,
+    config: Config, clients: AzureClients, *, replace: bool = False, fresh: bool = False,
     egress_capture: Callable[[dict[str, Any]], None] | None = None,
+    status_capture: StatusSink = None,
 ) -> str:
+    if fresh and replace:
+        raise ValueError("Fresh empty-group readiness cannot be combined with replacement.")
+    trace = StatusRecorder.coerce(status_capture)
     egress = deployment_egress(config)
     warn_unrestricted_egress(config.egress_mode)
     document = runtime_document(config)
     if not config.image:
         raise ValueError("Supply an existing public immutable HERMES_IMAGE before deployment.")
     assert_owner(clients.credential, config)
-    provision_group(config, clients)
-    sandboxes, images, volumes = owned_inventory(config, clients)
+    provision_group(config, clients, fresh=fresh, **trace.options())
+    sandboxes, images, volumes = owned_inventory(config, clients, **trace.options())
+    if fresh:
+        with trace.step("provision.fresh-inventory", error_category="inventory_count", details={
+            "count": len(sandboxes) + len(images) + len(volumes),
+        }):
+            if sandboxes or images or volumes:
+                raise RuntimeError("Fresh inventory changed after readiness; existing data was not adopted or changed.")
     if sandboxes and not replace:
         sandbox = clients.group.get_sandbox_client(sandboxes[0].id)
         raw = raw_sandbox(sandbox)
@@ -299,13 +535,15 @@ def deploy(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--replace", action="store_true", help="Replace the owned sandbox, preserving its single-writer DataDisk.")
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument("--replace", action="store_true", help="Replace the owned sandbox, preserving its single-writer DataDisk.")
+    lifecycle.add_argument("--fresh", action="store_true", help="Require sustained readiness of an owned empty group before first deployment.")
     parser.add_argument("--confirm-target", help="Exact full Sandbox Group resource ID authorizing this operation.")
     args = parser.parse_args()
     config = load_egress_config(args.env_file)
     confirm_target(config, args.confirm_target)
     with AzureClients.create(config) as clients:
-        identifier = deploy(config, clients, replace=args.replace)
+        identifier = deploy(config, clients, replace=args.replace, fresh=args.fresh)
     print(f"Hermes sandbox ready: {identifier}")
     print("Use scripts/access_hermes.py. Personal pairing, Google consent and Foundry inference remain separate gates.")
 

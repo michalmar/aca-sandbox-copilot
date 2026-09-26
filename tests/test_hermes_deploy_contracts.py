@@ -923,7 +923,11 @@ class StatusEvidenceTests(unittest.TestCase):
             [(event["operation"], event["event"]) for event in events],
             [(f"hermes.status.v1.{operation}", phase) for operation in self.ORDER for phase in ("begin", "pass")],
         )
-        self.assertEqual({event["operation"] for event in events}, common.STATUS_OPERATION_IDS)
+        self.assertEqual({event["operation"] for event in events}, {
+            operation for operation in common.STATUS_OPERATION_IDS
+            if not operation.startswith("hermes.status.v1.readiness.")
+            and not operation.startswith("hermes.status.v1.provision.")
+        })
         self.assertEqual([event["sequence"] for event in events], list(range(1, len(events) + 1)))
         self.assertTrue(all(event["schema_version"] == 1 for event in events))
         self.assertEqual(result["foundry_inference"], "NOT VERIFIED")
@@ -2151,7 +2155,7 @@ class OrderedDeploymentTests(unittest.TestCase):
 
         replacements = {
             "assert_owner": lambda *args: None,
-            "provision_group": lambda *args: None,
+            "provision_group": lambda *args, **kwargs: None,
             "owned_inventory": lambda *args: (
                 [SimpleNamespace(id=identifier) for identifier in self.active], list(self.images.values()), list(self.volumes),
             ),
