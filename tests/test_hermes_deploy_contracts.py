@@ -800,6 +800,10 @@ class SchemaEgressTests(unittest.TestCase):
 
 class StatusEvidenceTests(unittest.TestCase):
     CANARY = "STATUS_PRIVATE_CANARY"
+    SIZE_FORMS = (
+        ("1Gi", "literal_1Gi"), ("1073741824", "bytes_decimal"),
+        ("1024Mi", "mib_equivalent"), ("1048576Ki", "kib_equivalent"),
+    )
     ORDER = [
         "precheck.policy.capture", "precheck.policy.validate",
         "status.mode", "status.owner.credential", "status.owner.claims",
@@ -849,6 +853,7 @@ class StatusEvidenceTests(unittest.TestCase):
             "schema_version": 1, "dashboard": "running", "gateway": "not-paired",
             "whatsapp": "not-paired", "google": "disabled", "disk_free_bytes": common.MIN_FREE_BYTES,
         }
+        self.clients.resources.resource_groups.check_existence.return_value = True
         self.clients.resources.resource_groups.get.return_value = self.rg
         self.clients.groups.get_group.return_value = self.group
         self.clients.resources.resources.list_by_resource_group.return_value = [SimpleNamespace(id=self.config.group_scope)]
@@ -1343,10 +1348,227 @@ class StatusEvidenceTests(unittest.TestCase):
             ["hermes.status.v1." + name for name in self.ORDER[2:]],
         )
 
-    def test_exact_volume_type_size_and_absent_null_are_not_normalized(self):
+    def test_fixed_one_gib_response_forms_preserve_literal_evidence(self):
+        for value, tag in self.SIZE_FORMS:
+            with self.subTest(tag=tag):
+                self.setUp()
+                self.volume.size = value
+                events = []
+                with self.guest_mocks() as guest, patch.object(common.logging.getLogger("hermes.egress"), "warning"):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                checked = [event for event in events if event["operation"].endswith("inventory.volumes.check")]
+                self.assertEqual([event["event"] for event in checked], ["begin", "pass"])
+                for event in checked:
+                    self.assertIs(event["details"]["size_matches"], value == "1Gi")
+                    self.assertIs(event["details"]["size_bytes_matches"], True)
+                    self.assertEqual(event["details"]["size_tag"], tag)
+                    self.assertIs(event["details"]["size_present"], True)
+                    self.assertEqual(event["details"]["size_type"], "string")
+                self.assertNotIn(json.dumps(value), json.dumps(events))
+                self.assert_no_mutations()
+                self.assert_expected_guest_reads(guest)
+
+    def test_fixed_one_gib_response_forms_work_without_a_capture_sink(self):
+        for value, tag in self.SIZE_FORMS:
+            with self.subTest(tag=tag):
+                self.setUp()
+                self.volume.size = value
+                _, _, volumes = common.owned_inventory(self.config, self.clients)
+                self.assertEqual(volumes, [self.volume])
+                self.assert_no_mutations()
+
+    def test_one_gib_near_misses_never_use_numeric_parsing_or_normalization(self):
+        values = (
+            "01Gi", "+1Gi", "1gi", "1G", "1GB", "1GiB", "1 GiB", "1Gi ",
+            "1073741824.0", "1073741824 ", " 1073741824", "1073741824\n", "\t1073741824",
+            "01073741824", "1024.0Mi", "01024Mi", "1048576ki", "01048576Ki",
+            "0", "-1", "-1Gi", "0Gi", "2Gi", "1073741823", "1073741825",
+            "1Ti", "1048576K", "1024M", "1K", "1M", "1Mi", "1Ki", "256Mi", "2048", "1000000000",
+            "1073741824000m", "1.073741824G", "1073741824e0", "1e9", "1E0", "1_Gi",
+            "1Gi\0", "\uff11Gi", "1G\u0456", "\u00a01073741824", "107374182\u0664",
+            "9223372036854775808", "9223372036854775808Gi", "9" * 10000,
+        )
+        for index, value in enumerate(values):
+            with self.subTest(case=index):
+                self.setUp()
+                self.volume.size = value
+                events = []
+                with self.assertRaises(RuntimeError):
+                    common.owned_inventory(self.config, self.clients, status_capture=events.append)
+                self.assertEqual(events[-1]["error_category"], "volume_size_mismatch")
+                self.assertIs(events[-1]["details"]["size_matches"], False)
+                self.assertIs(events[-1]["details"]["size_bytes_matches"], False)
+                self.assertNotIn("size_tag", events[-1]["details"])
+                self.assert_no_mutations()
+
+    def test_one_gib_nonstring_values_are_not_coerced_or_compared(self):
+        class NotAString:
+            def __eq__(self, _):
+                raise AssertionError("Unexpected size equality.")
+
+            def __str__(self):
+                raise AssertionError("Unexpected size conversion.")
+
+            def __hash__(self):
+                raise AssertionError("Unexpected size hashing.")
+
+        class StringSubclass(str):
+            pass
+
+        values = (
+            0, -1, 1073741824, 1073741823, 1073741825, 1073741824.0,
+            True, False, None, b"1Gi", bytearray(b"1Gi"), ["1Gi"], {"size": "1Gi"},
+            {"1Gi"}, NotAString(), StringSubclass("1Gi"),
+        )
+        for index, value in enumerate(values):
+            with self.subTest(case=index):
+                self.setUp()
+                self.volume.size = value
+                events = []
+                with self.assertRaises(RuntimeError):
+                    common.owned_inventory(self.config, self.clients, status_capture=events.append)
+                self.assertEqual(events[-1]["error_category"], "volume_size_mismatch")
+                self.assertIs(events[-1]["details"]["size_matches"], False)
+                self.assertIs(events[-1]["details"]["size_bytes_matches"], False)
+                self.assertNotIn("size_tag", events[-1]["details"])
+                self.assert_no_mutations()
+
+    def test_unknown_size_canaries_are_never_retained_or_echoed(self):
+        values = (
+            self.CANARY, f"1Gi-{self.CANARY}", f"https://{self.CANARY}.invalid/?token={self.CANARY}",
+            self.config.whatsapp_phone, {"Authorization": self.CANARY}, [self.CANARY],
+        )
+        for index, value in enumerate(values):
+            with self.subTest(case=index):
+                self.setUp()
+                self.volume.size = value
+                events = []
+                output = io.StringIO()
+                with (
+                    redirect_stdout(output),
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning") as warning,
+                    self.guest_mocks() as guest,
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    self.inspect(events.append, precheck=False)
+                retained = json.dumps(events) + output.getvalue() + str(raised.exception) + str(warning.call_args_list)
+                for private in (self.CANARY, self.config.whatsapp_phone, "Authorization"):
+                    self.assertNotIn(private, retained)
+                self.assertEqual(events[-1]["error_category"], "volume_size_mismatch")
+                self.assertNotIn("size_tag", events[-1]["details"])
+                self.assertIs(events[-1]["details"]["size_bytes_matches"], False)
+                self.clients.group.get_sandbox_client.assert_not_called()
+                for operation in guest:
+                    operation.assert_not_called()
+                self.assert_no_mutations()
+
+    def test_size_capture_tags_and_byte_flags_have_closed_types(self):
+        for field, values in (
+            ("size_tag", ["unknown", "1Gi", "DataDisk", "Allow", self.CANARY, None, True, 1, {}, []]),
+            ("size_bytes_matches", [None, 0, 1, "literal_1Gi", self.CANARY, {}, []]),
+        ):
+            for index, value in enumerate(values):
+                with self.subTest(field=field, case=index):
+                    sink = MagicMock()
+                    recorder = common.StatusRecorder(sink)
+                    with self.assertRaises(common.StatusCaptureError) as raised:
+                        with recorder.step("inventory.volumes.check", details={field: value}):
+                            pass
+                    self.assertNotIn(self.CANARY, str(raised.exception))
+                    sink.assert_not_called()
+
+    def test_equivalent_size_never_relaxes_ownership_type_or_cardinality(self):
+        mutations = (
+            (lambda: self.volume.labels.clear(), "label_mismatch"),
+            (lambda: setattr(self.volume, "name", self.CANARY), "name_mismatch"),
+            (lambda: setattr(self.volume, "type", "AzureBlob"), "volume_type_mismatch"),
+            (lambda: setattr(self.clients.group.list_volumes, "return_value", [self.volume, self.volume]), "inventory_count"),
+            (lambda: setattr(self.clients.group.list_volumes, "return_value", []), "inventory_count"),
+            (lambda: setattr(self.clients.group.list_sandboxes, "return_value", [self.metadata, self.metadata]), "inventory_count"),
+        )
+        for value, tag in self.SIZE_FORMS:
+            for mutate, category in mutations:
+                with self.subTest(tag=tag, category=category):
+                    self.setUp()
+                    self.volume.size = value
+                    mutate()
+                    events = []
+                    with (
+                        patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                        self.guest_mocks() as guest, self.assertRaises(RuntimeError),
+                    ):
+                        self.inspect(events.append, precheck=False)
+                    self.assertEqual(events[-1]["error_category"], category)
+                    self.assertNotIn(self.CANARY, json.dumps(events))
+                    for operation in guest:
+                        operation.assert_not_called()
+                    self.assert_no_mutations()
+
+    def test_equivalent_size_capture_failure_still_blocks_before_selection(self):
+        for value, tag in self.SIZE_FORMS:
+            for phase in ("begin", "pass"):
+                with self.subTest(tag=tag, phase=phase):
+                    self.setUp()
+                    self.volume.size = value
+                    events = []
+
+                    def persist(event):
+                        events.append(event)
+                        if event["operation"].endswith("inventory.volumes.check") and event["event"] == phase:
+                            raise OSError(self.CANARY)
+
+                    with (
+                        self.guest_mocks() as guest,
+                        patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                        self.assertRaises(common.StatusCaptureError) as raised,
+                    ):
+                        self.inspect(common.StatusRecorder(persist), precheck=False)
+                    self.assertEqual(raised.exception.operation, "hermes.status.v1.inventory.volumes.check")
+                    self.assertEqual(raised.exception.event, phase)
+                    self.assertNotIn(self.CANARY, json.dumps(events) + str(raised.exception))
+                    self.clients.group.get_sandbox_client.assert_not_called()
+                    for operation in guest:
+                        operation.assert_not_called()
+                    self.assert_no_mutations()
+
+    def test_cleanup_uses_the_same_size_policy_and_preserves_personal_data(self):
+        for value, tag in self.SIZE_FORMS:
+            with self.subTest(tag=tag):
+                self.setUp()
+                self.volume.size = value
+                self.clients.group.list_sandboxes.return_value = []
+                self.clients.group.list_disk_images.return_value = []
+                with redirect_stdout(io.StringIO()) as output:
+                    cleanup_hermes.cleanup(self.config, self.clients)
+                self.assertIn("were preserved", output.getvalue())
+                self.assertEqual([call[0] for call in self.clients.mock_calls], [
+                    "credential.get_token", "resources.resource_groups.check_existence",
+                    "resources.resource_groups.get", "groups.get_group",
+                    "resources.resources.list_by_resource_group", "group.list_sandboxes",
+                    "group.list_disk_images", "group.list_volumes", "group.list_sandboxes",
+                ])
+
+    def test_cleanup_rejects_unknown_size_before_stopping_or_deleting_anything(self):
+        self.volume.size = self.CANARY
+        with (
+            patch.object(cleanup_hermes, "quiesce_gateway") as quiesce,
+            patch.object(cleanup_hermes, "delete_sandbox_confirmed") as delete,
+            redirect_stdout(io.StringIO()) as output,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            cleanup_hermes.cleanup(self.config, self.clients)
+        quiesce.assert_not_called()
+        delete.assert_not_called()
+        self.clients.group.begin_delete_disk_image.assert_not_called()
+        self.clients.group.begin_delete_volume.assert_not_called()
+        self.clients.groups.begin_delete_group.assert_not_called()
+        self.clients.resources.resource_groups.begin_delete.assert_not_called()
+        self.assertNotIn(self.CANARY, output.getvalue() + str(raised.exception))
+
+    def test_volume_type_invalid_size_and_absent_null_fail_closed(self):
         for field, values, category in (
             ("type", ["datadisk", "DataDisk ", self.CANARY, None, [], {}], "volume_type_mismatch"),
-            ("size", ["1024Mi", "1GiB", "1073741824", 1073741824, True, self.CANARY, None, [], {}],
+            ("size", ["1GiB", "1073741823", 1073741824, True, self.CANARY, None, [], {}],
              "volume_size_mismatch"),
         ):
             for value in values:
@@ -1369,11 +1591,15 @@ class StatusEvidenceTests(unittest.TestCase):
                 events = []
                 with (
                     patch.object(common.logging.getLogger("hermes.egress"), "warning"),
-                    self.assertRaises(AttributeError if absent else RuntimeError),
+                    self.assertRaises(RuntimeError),
                 ):
                     self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertEqual(events[-1]["error_category"], "volume_size_mismatch")
                 self.assertEqual(events[-1]["details"]["size_present"], not absent)
                 self.assertEqual(events[-1]["details"]["size_type"], "absent" if absent else "null")
+                self.assertIs(events[-1]["details"]["size_matches"], False)
+                self.assertIs(events[-1]["details"]["size_bytes_matches"], False)
+                self.assertNotIn("size_tag", events[-1]["details"])
 
     def test_current_sdk_name_aliases_string_enums_and_region_spelling_still_work(self):
         from azure.containerapps.sandbox._models import Volume
@@ -1382,19 +1608,46 @@ class StatusEvidenceTests(unittest.TestCase):
             DATA = "DataDisk"
 
         for name in ("name", "volumeName"):
-            with self.subTest(name_field=name):
+            for size, tag in self.SIZE_FORMS:
+                with self.subTest(name_field=name, tag=tag):
+                    self.setUp()
+                    self.rg.location = "Sweden Central"
+                    self.group.location = "SWEDEN CENTRAL"
+                    volume = Volume._from_dict({
+                        name: self.config.volume_name, "type": DiskKind.DATA, "size": size, "labels": self.config.labels,
+                    })
+                    self.assertIs(volume.size, size)
+                    self.clients.group.list_volumes.return_value = [volume]
+                    events = []
+                    with self.guest_mocks(), patch.object(common.logging.getLogger("hermes.egress"), "warning"):
+                        self.inspect(common.StatusRecorder(events.append), precheck=False)
+                    observed = next(event for event in events if event["operation"].endswith("inventory.volumes.check"))
+                    self.assertEqual(observed["details"]["volume_type_tag"], "DataDisk")
+                    self.assertEqual(observed["details"]["size_tag"], tag)
+                    self.assertIs(observed["details"]["size_matches"], size == "1Gi")
+                    self.assertIs(observed["details"]["size_bytes_matches"], True)
+
+    def test_sdk_missing_and_null_sizes_remain_unknown_despite_attribute_presence(self):
+        from azure.containerapps.sandbox._models import Volume
+
+        for fields in ({}, {"size": None}):
+            with self.subTest(wire_key_present="size" in fields):
                 self.setUp()
-                self.rg.location = "Sweden Central"
-                self.group.location = "SWEDEN CENTRAL"
-                self.clients.group.list_volumes.return_value = [Volume._from_dict({
-                    name: self.config.volume_name, "type": DiskKind.DATA, "size": "1Gi", "labels": self.config.labels,
-                })]
+                volume = Volume._from_dict({
+                    "volumeName": self.config.volume_name, "type": "DataDisk", "labels": self.config.labels, **fields,
+                })
+                self.clients.group.list_volumes.return_value = [volume]
+                self.assertIsNone(volume.size)
                 events = []
-                with self.guest_mocks(), patch.object(common.logging.getLogger("hermes.egress"), "warning"):
-                    self.inspect(common.StatusRecorder(events.append), precheck=False)
-                observed = next(event for event in events if event["operation"].endswith("inventory.volumes.check"))
-                self.assertEqual(observed["details"]["volume_type_tag"], "DataDisk")
-                self.assertEqual(observed["details"]["size_tag"], "1Gi")
+                with self.assertRaises(RuntimeError):
+                    common.owned_inventory(self.config, self.clients, status_capture=events.append)
+                self.assertEqual(events[-1]["error_category"], "volume_size_mismatch")
+                self.assertIs(events[-1]["details"]["size_present"], True)
+                self.assertEqual(events[-1]["details"]["size_type"], "null")
+                self.assertIs(events[-1]["details"]["size_matches"], False)
+                self.assertIs(events[-1]["details"]["size_bytes_matches"], False)
+                self.assertNotIn("size_tag", events[-1]["details"])
+                self.assert_no_mutations()
 
     def test_current_inventory_permits_old_owned_images_without_digest_assertion(self):
         old = SimpleNamespace(labels=dict(self.image.labels), image=SimpleNamespace(base=self.CANARY))
@@ -2738,7 +2991,9 @@ class OrderedDeploymentTests(unittest.TestCase):
         self.volumes.clear()
         self.paired = False
         self.assertEqual(deploy_hermes.deploy(self.config, self.clients), "new-sandbox")
-        self.clients.group.create_volume.assert_called_once()
+        self.clients.group.create_volume.assert_called_once_with(
+            self.config.volume_name, type="DataDisk", size="1Gi", labels=self.config.labels,
+        )
         self.assertNotIn("reconfigure:new-sandbox", self.events)
         self.assertLess(self.events.index("upload-runtime"), self.events.index("open-port"))
 

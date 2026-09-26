@@ -7,18 +7,21 @@ v review 9,2 -> 9,9/10 a přesný finální zdroj ještě v neskórovaném
 uzavření bez blockerů. B9 kompatibilita s novou HTTP egress schema
 byla přijata 9,6 -> 9,9/10. B11 bezpečná status/inventory diagnostika
 byla přijata 9,7 -> 9,9/10. B13 sustained readiness byla po opravě
-skutečné SDK envelope vady přijata 7,7 -> 9,5/10.
+skutečné SDK envelope vady přijata 7,7 -> 9,5/10. B15 úzká 1 GiB
+StorageQuantity kompatibilita byla přijata 9,4/10.
 U A nezůstávají opravitelné nálezy; zbývající odpočet je za přiznanou
 strukturální složitost, nikoli neopravené vady. Přesné lokální image
-a jejich integrační brány prošly. Všech 50 implementačních souborů bylo
+a jejich integrační brány prošly. Všech 51 implementačních souborů bylo
 předáno do hlavního checkoutu a znovu ověřeno včetně celé hostitelské sady.
-Tři skutečné MVP deploy pokusy byly bezpečně ukončeny a plně uklizeny.
+Čtyři skutečné MVP deploy pokusy byly bezpečně ukončeny a plně uklizeny.
 B9 odstranil první policy-schema blocker a druhý pokus živě prokázal
 root/HTTP `Allow + None + Enforced`; zastavil se však v následné status
 cestě bez dostatečně přesného checkpointu. B11 přidává diagnostiku této
 cesty. Třetí pokus odhalil nestabilní data-plane readiness: jeden
 úspěšný průchod následoval za 4,5 s HTTP 403. B13 zpřísňuje fresh
-readiness. Čtvrtý cloudový pokus zůstává BLOCKED na samostatném schválení.
+readiness. Čtvrtý pokus prošel readiness i deployem, ale status odmítl jiný
+dokumentovaný zápis 1 GiB. B15 přidává úzkou kompatibilitu. Pátý
+cloudový pokus zůstává BLOCKED na samostatném schválení.
 Souhlasy a výsledky jsou v §11; další pokus není automaticky povolený.
 Datum: 2026-09-26.
 
@@ -933,6 +936,41 @@ driver musí vytvořit a ověřit původní ARM/group klienty s
 `retry_total=0`. Tři roundy nejsou garance propagace; pozdější 403
 stále znamená cleanup.
 
+Uživatel poté schválil čtvrtý skutečný pokus. Run
+`4bbf791a-a39f-4952-a22b-6b80addb61f9` použil B13 production
+`fresh=True`, původní ARM/group klienty ověřené s `retry_total=0`
+a nový frozen driver. Tři kompletní čtyřreadové prázdné inventory
+roundy prošly nejméně 10 sekund od sebe bez permission resetu a původní
+následný `list_volumes` také prošel. Vznikl 1Gi-requested DataDisk,
+image a jediný sandbox; Running, runtime upload/readback, normální TLS
+smoke, dashboard a owner-only port 8080 prošly.
+
+Následná B11 operace `hermes.status.v1.inventory.volumes.check` selhala
+s konečnou kategorií `volume_size_mismatch`. Name, labels a typ
+`DataDisk` odpovídaly; size byla přítomná jako string, ale nebyla
+doslovně `1Gi`. Bezpečná projekce nezachovala její spelling, délku ani
+hodnotu, takže konkrétní live zápis zůstává neznámý. Šest klientských
+kontrol, MI provenance, owner HTTP/WS a inference nebyly dosažené.
+Cleanup zavřel port a odstranil sandbox, image, disk, role, group i RG;
+samostatný proces potvrdil RG/group/obě assignments jako 404.
+
+Oficiální současný REST TypeSpec definuje `DataDiskVolume.size` jako
+povinný string `StorageQuantity` s Kubernetes-style Mi/Gi a bare integer
+zápisy, ale bez size-specific canonicalization garance. SDK `0.1.0b4`
+hodnotu `size` předává beze změny; současné schema `2026-09-01-preview`
+není důkazem normalizace staršího wire API `2026-02-01-preview`.
+
+B15 proto ponechává create request přesně `1Gi`, ale response přijme
+jen čtyři přesné ASCII zápisy stejné kapacity:
+`1Gi`, `1073741824`, `1024Mi`, `1048576Ki`. Neobsahuje obecný parser,
+coercion, whitespace, znaménka, case folding, floats ani rounding.
+Historické `size_matches` nadále znamená doslovnou rovnost `1Gi`;
+nové `size_bytes_matches` a closed `size_tag` bezpečně rozlišují čtyři
+schválené varianty. Neznámé, chybějící, null a nonstring hodnoty dál
+fail closed bez uložení raw hodnoty. Stejný predicate používá deploy,
+status i cleanup; fresh readiness zůstává empty-only. B15 netvrdí,
+že by konkrétní ztracený run-4 spelling prošel.
+
 Pro plán a lokální implementaci nejsou potřeba tajné hodnoty. Až bude
 implementace připravená, uživatel bezpečnou lokální konfigurací dodá:
 
@@ -970,7 +1008,7 @@ příslušných session.
 | Proud | Dosavadní skóre Opus 5.5 | Stav |
 | --- | --- | --- |
 | A: runtime a WhatsApp | 6,2 -> 7,8 -> 8,0; náhradní kritik 9,15 -> 9,60/10 | Finální A6 přijata bez opravitelných nálezů či vad důkazů. Opravené lifecycle/RPC, skutečný bridge, pre-tool `@reference` I/O a přísný dependency graph. Prošly přesné image, 121 nativních Python a 12 Node testů, skutečný entrypoint a browser scénáře. Zbývající odpočet je za strukturální patchování upstreamu, dvě schválené výjimky a zdokumentované provozní limity; není důvod vyrábět další nezměněná review nebo tvrdit 10/10. |
-| B: Azure a přístup | B7: 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10; B8 MVP: 9,2 -> 9,9/10 + neskórované ACCEPT; B9 schema: 9,6 -> 9,9/10; B11 status: 9,7 -> 9,9/10; B13 readiness: 7,7 -> 9,5/10 ACCEPT | B7 zůstává historicky schválený hardened základ. B8 zavedl explicitní `allow-all-mvp`, B9 fixed-schema policy a B11 durable status/inventory diagnostiku. Po třetím plně uklizeném same-client 403 blockeru B13 přidává explicitní fresh-only tříroundovou readiness, přesné SDK envelopes a retry-zero driver povinnost bez mutation retry. Změnil/přidal pět host-side souborů; runtime/image/C/workflow/dependency bytes zůstaly identické. Skóre není schválení čtvrtého live pokusu. |
+| B: Azure a přístup | B7: 7,7 -> 9,15 -> 9,35 -> 9,50 -> 9,75 -> 9,95 -> 10/10; B8 MVP: 9,2 -> 9,9/10 + neskórované ACCEPT; B9 schema: 9,6 -> 9,9/10; B11 status: 9,7 -> 9,9/10; B13 readiness: 7,7 -> 9,5/10; B15 volume: 9,4/10 ACCEPT | B8 zavedl explicitní `allow-all-mvp`, B9 fixed-schema policy, B11 durable status diagnostiku a B13 fresh-only sustained readiness s přesnými SDK envelopes. Po čtvrtém plně uklizeném blockeru B15 přijímá pouze čtyři přesné dokumentované 1 GiB StorageQuantity zápisy a zachovává fail-closed ownership/cleanup. Změnil čtyři host-side soubory; runtime/image/C/workflow/dependency bytes zůstaly identické. Skóre není schválení pátého live pokusu. |
 | C: Google read-only | 8,6 -> 9,8 -> 10/10; samostatná integrační revize C4 znovu 10/10 | Předaný C4 patch je nezávisle zreviewovaný, 104 lokálních testů prošlo. Nativní timing/cancellation a fake-bridge WhatsApp tools jsou další offline integrační důkazy. Osobní OAuth/P9/soak tím neprošly. |
 
 Žádný z těchto výsledků neodstraňuje blokaci produkčního deploye ani
@@ -1001,18 +1039,21 @@ patch, SHA-256
 Po třetím plně uklizeném pokusu byl aplikován reviewovaný B13 delta
 patch, SHA-256
 `dd4e93350938f330711b498dd306a67920496f83d06f59a3320f6024435595b9`.
+Po čtvrtém plně uklizeném pokusu byl aplikován reviewovaný B15 delta
+patch, SHA-256
+`fbcc0e0ffaaaf346dbfdfb59945287f40df0cd6e2b4d34f354cf47d26b73453e`.
 Všech 50 souborů včetně executable bitů odpovídá finálnímu manifestu;
 tento plán je samostatný doprovodný dokument. Původní Copilot implementace
 zůstala beze změny, kromě odkazu v README a dvou pravidel `.gitignore`.
 Nevznikl commit, push, PR ani publikace image.
 
-Finální B13 replay před předáním: B sada **271 celkem / 257 prošlo /
-14 image-only přeskočeno**, úplná host sada **503 / 436 / 67** a přesná
-existující SDK image **266 / 266 / 0** (původních 52 bran plus 214
-policy/lifecycle/status/readiness kontraktů). Všech 38 readiness testů
-prošlo na host tier i v SDK image. Přesná množina 67 přeskočených ID
-i důvodů odpovídá A6 image-covered sadě. Runtime/image vstupy se
-nezměnily, proto se image znovu nestavěly.
+Finální B15 replay před předáním: B sada **283 celkem / 269 prošlo /
+14 image-only přeskočeno**, úplná host sada **515 / 448 / 67** a přesná
+existující SDK image **278 / 278 / 0** (původních 52 bran plus 226
+policy/lifecycle/status/readiness/volume kontraktů). Všech 13 nových
+nebo přejmenovaných test ID prošlo ve všech tier. Přesná množina 67
+přeskočených ID i důvodů odpovídá A6 image-covered sadě. Runtime/image
+vstupy se nezměnily, proto se image znovu nestavěly.
 
 Provozní návod je v [hermes.md](hermes.md). Schválení lokálního kódu
 neodemyká produkční deploy: zbývá samostatně povolené živé ověření sítě,

@@ -44,6 +44,13 @@ INGRESS_SCOPE = "https://auth.adcproxy.io/.default"
 INGRESS_AUDIENCES = {"https://auth.adcproxy.io/", "9f34678b-7f96-4c6d-ac69-b06b1255b61e"}
 LABELS = {"managed-by": "aca-sandbox-hermes"}
 MIN_FREE_BYTES = 256 * 1024 * 1024
+# Exact spellings of 1 GiB (1073741824 bytes), not a general quantity parser.
+_ONE_GIB_SIZE_TAGS = {
+    "1Gi": "literal_1Gi",
+    "1073741824": "bytes_decimal",
+    "1024Mi": "mib_equivalent",
+    "1048576Ki": "kib_equivalent",
+}
 GOOGLE_HOSTS = ("oauth2.googleapis.com", "gmail.googleapis.com", "www.googleapis.com")
 MVP_EGRESS_MODE = "allow-all-mvp"
 EGRESS_SCHEMA_VERSION = "2026-09-01-preview"
@@ -441,7 +448,8 @@ _STATUS_FIELDS = frozenset({
     "identity_kind_type", "system_assigned_matches", "principal_present", "principal_type",
     "principal_id_shape_matches", "name_present", "name_type", "name_matches", "base_type",
     "base_digest_matches", "volume_type_present", "volume_type", "volume_type_matches", "volume_type_tag",
-    "size_present", "size_type", "size_matches", "size_tag", "config_mode_matches", "token_acquired",
+    "size_present", "size_type", "size_matches", "size_bytes_matches", "size_tag",
+    "config_mode_matches", "token_acquired",
     "claims_type", "tenant_matches", "owner_matches", "user_type_matches", "audience_matches",
     "runtime_matches", "key_checked", "control_checked", "connected_hosts_count",
     "round_index", "consecutive_rounds", "reads_completed", "pages_completed", "elapsed_ms",
@@ -452,7 +460,7 @@ _STATUS_LITERALS = frozenset({
     "absent", "null", "boolean", "string", "object", "array", "number", "unsupported", "iterable",
     "DataDisk", "1Gi", "create", "get", "NOT EVALUATED",
     EGRESS_SCHEMA_VERSION, EGRESS_SCHEMA_COMMIT, EGRESS_SCHEMA_MODEL_SHA256,
-}) | frozenset(literal for literals in _EGRESS_ENUMS.values() for literal in literals)
+}) | frozenset(literal for literals in _EGRESS_ENUMS.values() for literal in literals) | frozenset(_ONE_GIB_SIZE_TAGS.values())
 
 
 def _safe_status_value(value: Any, depth: int = 0) -> bool:
@@ -465,7 +473,10 @@ def _safe_status_value(value: Any, depth: int = 0) -> bool:
     if type(value) is str:
         return value in _STATUS_LITERALS
     return type(value) is dict and len(value) <= 128 and all(
-        type(key) is str and key in _STATUS_FIELDS and _safe_status_value(child, depth + 1)
+        type(key) is str and key in _STATUS_FIELDS
+        and (key != "size_tag" or type(child) is str and child in _ONE_GIB_SIZE_TAGS.values())
+        and (key != "size_bytes_matches" or type(child) is bool)
+        and _safe_status_value(child, depth + 1)
         for key, child in value.items()
     )
 
@@ -1367,6 +1378,7 @@ def owned_inventory(
                 raise RuntimeError("Unrecognized Hermes disk image name.")
     for index, volume in enumerate(volumes):
         kind, size = getattr(volume, "type", None), getattr(volume, "size", None)
+        size_tag = _ONE_GIB_SIZE_TAGS.get(size) if type(size) is str else None
         details = {
             "item_index": index, **_status_labels(getattr(volume, "labels", None), config),
             "name_present": hasattr(volume, "name"),
@@ -1377,12 +1389,13 @@ def owned_inventory(
             "volume_type_matches": kind == "DataDisk",
             "size_present": hasattr(volume, "size"),
             "size_type": _egress_value_type(size) if hasattr(volume, "size") else "absent",
-            "size_matches": size == "1Gi",
+            "size_matches": type(size) is str and size == "1Gi",
+            "size_bytes_matches": size_tag is not None,
         }
         if kind == "DataDisk":
             details["volume_type_tag"] = "DataDisk"
-        if size == "1Gi":
-            details["size_tag"] = "1Gi"
+        if size_tag is not None:
+            details["size_tag"] = size_tag
         with trace.step("inventory.volumes.check", error_category="label_mismatch", details=details) as step:
             assert_labels(volume.labels, config, "DataDisk")
             step.error_category = "name_mismatch"
@@ -1392,7 +1405,7 @@ def owned_inventory(
             if volume.type != "DataDisk":
                 raise RuntimeError("The managed pilot requires exactly its own 1 GiB DataDisk.")
             step.error_category = "volume_size_mismatch"
-            if volume.size != "1Gi":
+            if size_tag is None:
                 raise RuntimeError("The managed pilot requires exactly its own 1 GiB DataDisk.")
     with trace.step("inventory.volumes.count", error_category="inventory_count", details={"count": len(volumes)}):
         if len(volumes) > 1:

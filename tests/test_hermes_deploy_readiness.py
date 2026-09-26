@@ -346,6 +346,25 @@ class FreshReadinessTests(unittest.TestCase):
                 self.assertNotIn(CANARY, json.dumps(self.events))
                 self.assert_no_mutations()
 
+    def test_fresh_readiness_rejects_nonempty_volumes_regardless_of_size_representation(self):
+        for index, size in enumerate(("1Gi", "1073741824", "1024Mi", "1048576Ki", CANARY, None)):
+            with self.subTest(case=index):
+                self.setUp()
+                self.transport.queue.append(reply(body={"value": [{
+                    "volumeName": self.config.volume_name, "type": "DataDisk", "size": size,
+                    "labels": self.config.labels,
+                }]}))
+                with self.assertRaisesRegex(RuntimeError, "empty owned group"):
+                    self.provision()
+                self.assertEqual(len(self.transport.calls), 1)
+                self.assertEqual(self.clock.sleeps, [])
+                self.assertTrue(any(event.get("error_category") == "inventory_count" for event in self.events))
+                self.assertEqual(self.completed("readiness.wait"), [])
+                self.assertEqual(self.completed("provision.volumes.list"), [])
+                self.assertNotIn(CANARY, json.dumps(self.events))
+                self.assertTrue(all("size_tag" not in event["details"] for event in self.events))
+                self.assert_no_mutations()
+
     def test_secrets_schema_matches_sdk_and_structural_details_are_durable(self):
         self.provision()
         pages = self.completed("readiness.secrets.list")

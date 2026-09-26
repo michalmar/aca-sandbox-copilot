@@ -111,14 +111,18 @@ introduced. Interrupted collections retain their count so far and
 `complete: false`; a raw GET response is recorded before its consistency check.
 
 Evidence contains only finite type tags, counts, expected-key/name/region/scope
-match booleans and approved literals (`DataDisk`, `1Gi`, known policy enums).
+match booleans, approved DataDisk size-representation tags and known policy enums.
 It never contains resource IDs, raw labels, credentials, headers, URLs, phone
 numbers, arbitrary service values or exception text. Group identity shape and
 image base-digest match are **observations**, not new assertions: inventory
-still permits older owned images for replacement. These are SDK-normalized
+still permits older owned images for replacement. These are SDK-deserialized
 attributes, not raw collection-wire evidence; SDK defaults can erase the
-difference between a missing wire field and null. Exact volume type/size
-checks are unchanged, with no size normalization or inferred service behavior.
+difference between a missing wire field and null. The SDK passes `size` through
+unchanged. `size_matches` retains its historical exact-`1Gi` meaning;
+`size_bytes_matches` separately reports the fixed application allowlist below.
+Only an accepted representation has a `size_tag`; unknown/missing/null values
+retain type/presence and false match flags, never a raw size value or its length.
+Existing sealed receipts are not rewritten or reinterpreted.
 
 The inspector remains read-only and propagates failures. A deployment runner
 must retain its existing fail-closed port/resource/RBAC cleanup; it must not
@@ -250,6 +254,40 @@ File, URL, git, and plugin `@context` references are refused before expansion or
 model invocation, including quiet CLI requests. Ordinary email text remains
 literal. The visible refusal is `Context references are disabled in managed
 Sandbox mode.`; it does not imply the requested content was read.
+
+### Fixed 1 GiB DataDisk response policy
+
+Creation still sends exactly `size: "1Gi"`. Response validation in the shared
+`owned_inventory` path used by deployment, status and cleanup accepts only
+these exact ASCII strings, each representing exactly 1,073,741,824 bytes:
+
+| Response string | Safe `size_tag` | `size_matches` | `size_bytes_matches` |
+| --- | --- | --- | --- |
+| `1Gi` | `literal_1Gi` | true | true |
+| `1073741824` | `bytes_decimal` | false | true |
+| `1024Mi` | `mib_equivalent` | false | true |
+| `1048576Ki` | `kib_equivalent` | false | true |
+
+This is a fixed mapping, not a general quantity parser. No trimming, signs,
+leading zeroes, case-folding, decimal/exponent syntax, alternate units,
+rounding or coercion is permitted. JSON numbers, booleans, missing/null values
+and every other string fail closed with `volume_size_mismatch`. Unknown sizes
+have no `size_tag`; the tag's absence is not an accepted size. Exact DataDisk
+type, ownership labels/name, inventory counts, single-writer rules and cleanup
+behavior are unchanged. Fresh readiness still rejects every nonempty inventory,
+including volumes with one of these accepted sizes; it cannot adopt a volume
+just because its size matches.
+
+The official [DataDisk model](https://github.com/Azure/azure-rest-api-specs/blob/7e7a9372bd1e8b88a00db8f100c0ba84a05b6e1c/specification/app/data-plane/ContainerApps/models/volumes.tsp)
+uses the [StorageQuantity scalar](https://github.com/Azure/azure-rest-api-specs/blob/7e7a9372bd1e8b88a00db8f100c0ba84a05b6e1c/specification/app/data-plane/ContainerApps/models/sandboxes.tsp#L1511-L1512),
+which describes Kubernetes-style storage quantity strings. The
+[generated OpenAPI](https://github.com/Azure/azure-rest-api-specs/blob/7e7a9372bd1e8b88a00db8f100c0ba84a05b6e1c/specification/app/data-plane/ContainerApps/preview/2026-09-01-preview/containerappssandbox.json)
+is `2026-09-01-preview`, while pinned SDK `0.1.0b4` uses `2026-02-01-preview`.
+**This allowlist is an application compatibility policy, not proven
+normalization by the older Azure API.** It neither proves physical disk capacity
+nor changes the separate free-space check. The fourth deployment's returned
+size was not retained and remains unknown; this policy does not establish that
+it would have accepted that value or authorize another live attempt.
 
 ## Local preparation
 
