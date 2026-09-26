@@ -71,6 +71,60 @@ durable sink and separately capture transport/parser failures before a raw
 document is available. The pure `egress_policy_observation` helper is shared
 with that capture path; no consumed driver is modified or reused.
 
+### Optional durable status evidence
+
+An authorized runner can share one `hermes_common.StatusRecorder(persist_event)`
+between `validate_egress(..., status_capture=recorder)` for its pre-status policy
+check and `test_hermes.inspect_deployment(..., capture=recorder, network=True)`.
+The existing deployment `egress_capture` callback remains separate. Neither
+default CLI output nor a call without a sink produces durable status evidence.
+This is a programmatic interface, not a new live-run authorization.
+
+The synchronous sink must persist each record before returning **None**, or
+raise. It owns private file permissions, append/atomic-write discipline and the
+required file/directory flushes. Async/non-void sinks are rejected, including
+on the legacy egress-capture path. A supplied sink failure raises
+`StatusCaptureError`, poisons that recorder against reuse, and prevents later
+checks or a successful inspection result. Its `operation`, `event`,
+`error_category` and optional `prior_error_category` are safe fixed identifiers;
+the sink's exception text and paths are suppressed. Ordinary check failures
+retain their original exception when their failure receipt can be persisted.
+
+Records use schema version 1, increasing sequence numbers, a closed
+`hermes.status.v1.*` operation catalog, and `begin`/`pass`/`fail` events. The
+precheck policy snapshot remains `NOT EVALUATED`: a separate capture `pass`
+acknowledges that the preceding snapshot sink returned; a validator `pass` is
+emitted only after the unchanged core predicate returns. A pass-record write
+can itself fail, so no individual file proves its own writer finished or the
+whole inspection succeeded. The next `status.mode/begin` establishes entry
+into the inspector after the precheck wrapper returned.
+
+The stream follows the existing call order: mode, fresh owner claims, RG GET
+and labels/region, group GET and labels/region, streamed ARM-resource ownership,
+sandbox/image/volume inventory and contracts, exact-one-volume, a **fresh
+repeated** ownership/selection sequence, and the next raw GET's begin/response.
+It also covers the subsequent policy/runtime/key/control and optional HTTPS
+checks. RG existence uses the existing GET/not-found result; no extra HEAD,
+credential request, guest command, port change, retry or cloud operation is
+introduced. Interrupted collections retain their count so far and
+`complete: false`; a raw GET response is recorded before its consistency check.
+
+Evidence contains only finite type tags, counts, expected-key/name/region/scope
+match booleans and approved literals (`DataDisk`, `1Gi`, known policy enums).
+It never contains resource IDs, raw labels, credentials, headers, URLs, phone
+numbers, arbitrary service values or exception text. Group identity shape and
+image base-digest match are **observations**, not new assertions: inventory
+still permits older owned images for replacement. These are SDK-normalized
+attributes, not raw collection-wire evidence; SDK defaults can erase the
+difference between a missing wire field and null. Exact volume type/size
+checks are unchanged, with no size normalization or inferred service behavior.
+
+The inspector remains read-only and propagates failures. A deployment runner
+must retain its existing fail-closed port/resource/RBAC cleanup; it must not
+catch a status-capture failure as a warning and preserve a failed deployment.
+This instrumentation does not identify the earlier sealed live failure,
+recover missing observations, or change any consumed driver.
+
 Nonempty rules, malformed fields, or conflicting values fail closed.
 For this **non-isolating MVP only**, unknown top-level metadata
 fields do not block solely because their names are new: diagnostics report their

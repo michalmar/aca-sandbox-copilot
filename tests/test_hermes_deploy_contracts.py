@@ -1,5 +1,6 @@
 """Host-tier policy and lifecycle tests; no Azure credentials or cloud mutations."""
 
+import base64
 import copy
 import io
 import json
@@ -8,14 +9,15 @@ import runpy
 import shlex
 import sys
 import tempfile
+import traceback
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from azure.core.exceptions import HttpResponseError, ResourceNotFoundError, ServiceRequestError
+from azure.core.exceptions import HttpResponseError, IncompleteReadError, ResourceNotFoundError, ServiceRequestError
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -796,6 +798,769 @@ class SchemaEgressTests(unittest.TestCase):
         self.assertEqual(snapshot["unclassified_field_count"], 1)
 
 
+class StatusEvidenceTests(unittest.TestCase):
+    CANARY = "STATUS_PRIVATE_CANARY"
+    ORDER = [
+        "precheck.policy.capture", "precheck.policy.validate",
+        "status.mode", "status.owner.credential", "status.owner.claims",
+        "inventory.ownership.rg.get", "inventory.ownership.rg.labels", "inventory.ownership.rg.region",
+        "inventory.ownership.group.get", "inventory.ownership.group.labels", "inventory.ownership.group.region",
+        "inventory.ownership.resources",
+        "inventory.sandboxes.list", "inventory.sandboxes.labels", "inventory.images.list", "inventory.volumes.list",
+        "inventory.sandboxes.count", "inventory.images.check", "inventory.volumes.check", "inventory.volumes.count",
+        "status.volume-count",
+        "selection.ownership.rg.get", "selection.ownership.rg.labels", "selection.ownership.rg.region",
+        "selection.ownership.group.get", "selection.ownership.group.labels", "selection.ownership.group.region",
+        "selection.ownership.resources", "selection.sandboxes.list", "selection.sandboxes.labels",
+        "selection.sandbox", "selection.client",
+        "status.raw.get", "status.raw.match", "status.lifecycle", "status.ports",
+        "status.policy.capture", "status.policy.validate", "status.runtime", "status.access-key", "status.control",
+        "network.raw.get", "network.raw.match", "network.policy.capture", "network.policy.validate", "network.https",
+    ]
+
+    def setUp(self):
+        self.config = config()
+        self.clients = MagicMock()
+        self.sandbox = MagicMock(sandbox_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        self.sandbox._sbx_path = "/private-sandbox-path"
+        labels = self.config.labels
+        self.rg = SimpleNamespace(tags=dict(labels), location=self.config.location)
+        self.group = SimpleNamespace(
+            tags=dict(labels), location=self.config.location,
+            identity={"type": "SystemAssigned", "principalId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
+        )
+        self.metadata = SimpleNamespace(id=self.sandbox.sandbox_id, labels={**labels, "name": self.config.sandbox_name})
+        self.image = SimpleNamespace(
+            labels={**labels, "name": self.config.disk_name}, image=SimpleNamespace(base=self.config.image),
+        )
+        self.volume = SimpleNamespace(
+            labels=dict(labels), name=self.config.volume_name, type="DataDisk", size="1Gi",
+        )
+        self.raw = {
+            "id": self.sandbox.sandbox_id, "state": "Running",
+            "lifecycle": {"autoSuspendPolicy": {"enabled": False}},
+            "ports": [common.port_document(self.config, self.sandbox.sandbox_id)],
+            "egressPolicy": {
+                **common.deployment_egress(self.config), "enforcementMode": "Enforced",
+                "http": {**common.deployment_egress(self.config), "enforcementMode": "Enforced"},
+            },
+        }
+        self.status = {
+            "schema_version": 1, "dashboard": "running", "gateway": "not-paired",
+            "whatsapp": "not-paired", "google": "disabled", "disk_free_bytes": common.MIN_FREE_BYTES,
+        }
+        self.clients.resources.resource_groups.get.return_value = self.rg
+        self.clients.groups.get_group.return_value = self.group
+        self.clients.resources.resources.list_by_resource_group.return_value = [SimpleNamespace(id=self.config.group_scope)]
+        self.clients.group.list_sandboxes.return_value = [self.metadata]
+        self.clients.group.list_disk_images.return_value = [self.image]
+        self.clients.group.list_volumes.return_value = [self.volume]
+        self.clients.group.get_sandbox_client.return_value = self.sandbox
+        self.sandbox._dp_get.return_value = self.raw
+        self.set_claims({
+            "tid": self.config.tenant_id, "oid": self.config.owner_object_id,
+            "idtyp": "user", "aud": next(iter(common.INGRESS_AUDIENCES)),
+        })
+
+    def set_claims(self, claims):
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        self.token = "e30." + payload + ".not-a-real-signature"
+        self.clients.credential.get_token.return_value = SimpleNamespace(token=self.token)
+
+    @contextmanager
+    def guest_mocks(self):
+        with (
+            patch.object(test_hermes, "read_runtime", return_value=common.runtime_document(self.config)) as runtime,
+            patch.object(test_hermes, "read_access_key") as key,
+            patch.object(test_hermes, "control_status", return_value=self.status) as control,
+            patch.object(common, "exec_checked", return_value=json.dumps({
+                "example.com": {"public_ca_tls": True, "http_status": 404},
+            })) as network,
+        ):
+            yield runtime, key, control, network
+
+    def inspect(self, recorder, *, precheck=True, network=True):
+        if precheck:
+            common.validate_egress(self.raw, common.deployment_egress(self.config), status_capture=recorder)
+        return test_hermes.inspect_deployment(self.config, self.clients, network=network, capture=recorder)
+
+    @contextmanager
+    def inject_step_error(self, target, error):
+        original = common.StatusRecorder.step
+
+        @contextmanager
+        def interrupted(recorder, operation, **kwargs):
+            with original(recorder, operation, **kwargs) as step:
+                if operation == target:
+                    raise error
+                yield step
+
+        with patch.object(common.StatusRecorder, "step", interrupted):
+            yield
+
+    def assert_no_mutations(self):
+        client_reads = {
+            "credential.get_token", "resources.resource_groups.get", "groups.get_group",
+            "resources.resources.list_by_resource_group", "group.list_sandboxes", "group.list_disk_images",
+            "group.list_volumes", "group.get_sandbox_client", "group.get_sandbox_client()._dp_get",
+        }
+        self.assertEqual({call[0] for call in self.clients.mock_calls} - client_reads, set())
+        self.assertEqual({call[0] for call in self.sandbox.mock_calls} - {"_dp_get"}, set())
+
+    def assert_expected_guest_reads(self, guest):
+        runtime, key, control, network = guest
+        for operation in (runtime, key, control):
+            operation.assert_called_once_with(self.sandbox)
+        network.assert_called_once_with(
+            self.sandbox, [common.PYTHON, "-c", common._NETWORK_PROBE, json.dumps(["example.com"])],
+        )
+
+    def test_real_owner_inventory_selection_sequence_and_no_added_mutations(self):
+        events = []
+        with self.guest_mocks() as guest, self.assertLogs("hermes.egress", level="WARNING"):
+            result = self.inspect(common.StatusRecorder(events.append))
+        self.assertEqual(
+            [(event["operation"], event["event"]) for event in events],
+            [(f"hermes.status.v1.{operation}", phase) for operation in self.ORDER for phase in ("begin", "pass")],
+        )
+        self.assertEqual({event["operation"] for event in events}, common.STATUS_OPERATION_IDS)
+        self.assertEqual([event["sequence"] for event in events], list(range(1, len(events) + 1)))
+        self.assertTrue(all(event["schema_version"] == 1 for event in events))
+        self.assertEqual(result["foundry_inference"], "NOT VERIFIED")
+        self.assertEqual(self.clients.credential.get_token.call_count, 1)
+        self.assertEqual(self.clients.resources.resource_groups.get.call_count, 2)
+        self.assertEqual(self.clients.group.list_sandboxes.call_count, 2)
+        self.assertEqual(self.sandbox._dp_get.call_count, 2)
+        self.assert_no_mutations()
+        self.assert_expected_guest_reads(guest)
+        self.assertEqual([call[0] for call in self.clients.mock_calls], [
+            "credential.get_token", "resources.resource_groups.get", "groups.get_group",
+            "resources.resources.list_by_resource_group", "group.list_sandboxes", "group.list_disk_images",
+            "group.list_volumes", "resources.resource_groups.get", "groups.get_group",
+            "resources.resources.list_by_resource_group", "group.list_sandboxes", "group.get_sandbox_client",
+            "group.get_sandbox_client()._dp_get", "group.get_sandbox_client()._dp_get",
+        ])
+
+    def test_read_only_oracle_rejects_extra_guest_commands_and_real_mutation_methods(self):
+        mutations = [
+            lambda: common.exec_checked(self.sandbox, ["synthetic-extra-command"]),
+            lambda: test_hermes.read_runtime(self.sandbox),
+            lambda: self.sandbox.write_file("/synthetic-extra-file", b"synthetic"),
+            lambda: self.sandbox.delete_file("/synthetic-extra-file"),
+            lambda: self.sandbox.begin_delete(),
+            lambda: self.clients.group._dp_put("/synthetic-extra-resource", {}),
+            lambda: self.clients.group._dp_post("/synthetic-extra-resource", {}),
+            lambda: self.clients.groups.begin_create_group("synthetic-extra-group"),
+            lambda: self.clients.group.begin_delete_disk_image("synthetic-extra-image"),
+            lambda: self.clients.resources.resource_groups.create_or_update("synthetic-extra-group", {}),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.setUp()
+                original = test_hermes.raw_sandbox
+
+                def with_extra_call(*args, **kwargs):
+                    raw = original(*args, **kwargs)
+                    mutate()
+                    return raw
+
+                with (
+                    self.guest_mocks() as guest,
+                    patch.object(test_hermes, "raw_sandbox", side_effect=with_extra_call),
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                ):
+                    self.inspect(common.StatusRecorder(lambda event: None))
+                with self.assertRaises(AssertionError):
+                    self.assert_no_mutations()
+                    self.assert_expected_guest_reads(guest)
+
+    def test_interrupt_at_every_operation_stops_with_ordered_failure_evidence(self):
+        for index, target in enumerate(self.ORDER):
+            with self.subTest(operation=target):
+                self.setUp()
+                events = []
+                with (
+                    self.guest_mocks() as guest,
+                    self.inject_step_error(target, KeyboardInterrupt(self.CANARY)),
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.inspect(common.StatusRecorder(events.append))
+                expected = [
+                    (f"hermes.status.v1.{name}", event)
+                    for name in self.ORDER[:index] for event in ("begin", "pass")
+                ] + [(f"hermes.status.v1.{target}", event) for event in ("begin", "fail")]
+                self.assertEqual([(event["operation"], event["event"]) for event in events], expected)
+                self.assertEqual(events[-1]["error_category"], "interrupted")
+                self.assertNotIn(self.CANARY, json.dumps(events))
+                if index <= self.ORDER.index("status.raw.match"):
+                    for call in guest:
+                        call.assert_not_called()
+                self.assert_no_mutations()
+
+    def test_persistence_failure_at_every_begin_and_pass_blocks_and_latches(self):
+        for target in self.ORDER:
+            for phase in ("begin", "pass"):
+                with self.subTest(operation=target, event=phase):
+                    self.setUp()
+                    events = []
+                    operation_id = "hermes.status.v1." + target
+
+                    def sink(event):
+                        events.append(event)
+                        if event["operation"] == operation_id and event["event"] == phase:
+                            raise OSError(self.CANARY)
+
+                    recorder = common.StatusRecorder(sink)
+                    with (
+                        self.guest_mocks() as guest,
+                        patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                        self.assertRaises(common.StatusCaptureError) as raised,
+                    ):
+                        self.inspect(recorder)
+                    self.assertEqual((raised.exception.operation, raised.exception.event), (operation_id, phase))
+                    self.assertEqual((events[-1]["operation"], events[-1]["event"]), (operation_id, phase))
+                    self.assertNotIn(self.CANARY, json.dumps(events) + "".join(traceback.format_exception(raised.exception)))
+                    count = len(events)
+                    with self.assertRaises(common.StatusCaptureError) as repeated:
+                        with recorder.step("status.mode"):
+                            self.fail("A failed evidence stream must not be reused.")
+                    self.assertIs(repeated.exception, raised.exception)
+                    self.assertEqual(len(events), count)
+                    if self.ORDER.index(target) <= self.ORDER.index("status.raw.match"):
+                        for call in guest:
+                            call.assert_not_called()
+                    self.assert_no_mutations()
+
+    def test_body_runtime_errors_are_preserved_unless_failure_receipt_cannot_persist(self):
+        for target in self.ORDER:
+            for fail_persistence in (False, True):
+                with self.subTest(operation=target, fail_persistence=fail_persistence):
+                    self.setUp()
+                    events = []
+                    original = RuntimeError(self.CANARY)
+
+                    def sink(event):
+                        events.append(event)
+                        if fail_persistence and event["event"] == "fail":
+                            raise OSError(self.CANARY)
+
+                    with (
+                        self.guest_mocks(),
+                        self.inject_step_error(target, original),
+                        patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                        self.assertRaises(RuntimeError) as raised,
+                    ):
+                        self.inspect(common.StatusRecorder(sink))
+                    self.assertEqual(events[-1]["operation"], "hermes.status.v1." + target)
+                    self.assertEqual(events[-1]["event"], "fail")
+                    self.assertIn(events[-1]["error_category"], common.STATUS_ERROR_CATEGORIES)
+                    if fail_persistence:
+                        self.assertIsInstance(raised.exception, common.StatusCaptureError)
+                        self.assertEqual(raised.exception.prior_error_category, events[-1]["error_category"])
+                        self.assertNotIn(self.CANARY, "".join(traceback.format_exception(raised.exception)))
+                    else:
+                        self.assertIs(raised.exception, original)
+                    self.assertNotIn(self.CANARY, json.dumps(events))
+                    self.assert_no_mutations()
+
+    def test_actual_sdk_read_interruptions_are_attributed_without_later_reads(self):
+        reads = [
+            ("status.owner.credential", lambda: self.clients.credential.get_token, 1),
+            ("inventory.ownership.rg.get", lambda: self.clients.resources.resource_groups.get, 1),
+            ("inventory.ownership.group.get", lambda: self.clients.groups.get_group, 1),
+            ("inventory.ownership.resources", lambda: self.clients.resources.resources.list_by_resource_group, 1),
+            ("inventory.sandboxes.list", lambda: self.clients.group.list_sandboxes, 1),
+            ("inventory.images.list", lambda: self.clients.group.list_disk_images, 1),
+            ("inventory.volumes.list", lambda: self.clients.group.list_volumes, 1),
+            ("selection.ownership.rg.get", lambda: self.clients.resources.resource_groups.get, 2),
+            ("selection.ownership.group.get", lambda: self.clients.groups.get_group, 2),
+            ("selection.ownership.resources", lambda: self.clients.resources.resources.list_by_resource_group, 2),
+            ("selection.sandboxes.list", lambda: self.clients.group.list_sandboxes, 2),
+            ("selection.client", lambda: self.clients.group.get_sandbox_client, 1),
+            ("status.raw.get", lambda: self.sandbox._dp_get, 1),
+            ("network.raw.get", lambda: self.sandbox._dp_get, 2),
+        ]
+        for operation, getter, invocation in reads:
+            with self.subTest(operation=operation):
+                self.setUp()
+                call = getter()
+                call.side_effect = [call.return_value] * (invocation - 1) + [KeyboardInterrupt(self.CANARY)]
+                events = []
+                with (
+                    self.guest_mocks(),
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.inspect(common.StatusRecorder(events.append))
+                self.assertEqual(events[-1]["operation"], "hermes.status.v1." + operation)
+                self.assertEqual(events[-1]["error_category"], "interrupted")
+                self.assertNotIn(self.CANARY, json.dumps(events))
+                self.assert_no_mutations()
+
+    def test_real_contract_failures_keep_their_exact_gates(self):
+        cases = [
+            (lambda: setattr(self.rg, "tags", None), "inventory.ownership.rg.labels", "label_mismatch"),
+            (lambda: self.rg.tags.update({"hermes-owner-object-id": self.CANARY}),
+             "inventory.ownership.rg.labels", "label_mismatch"),
+            (lambda: setattr(self.rg, "location", self.CANARY), "inventory.ownership.rg.region", "region_mismatch"),
+            (lambda: setattr(self.group, "tags", []), "inventory.ownership.group.labels", "label_mismatch"),
+            (lambda: setattr(self.group, "location", self.CANARY), "inventory.ownership.group.region", "region_mismatch"),
+            (lambda: setattr(self.clients.resources.resources.list_by_resource_group, "return_value",
+                             [SimpleNamespace(id=self.CANARY)]),
+             "inventory.ownership.resources", "foreign_resource"),
+            (lambda: setattr(self.metadata, "labels", {"private": self.CANARY}),
+             "inventory.sandboxes.labels", "label_mismatch"),
+            (lambda: setattr(self.clients.group.list_sandboxes, "return_value", [self.metadata, self.metadata]),
+             "inventory.sandboxes.count", "inventory_count"),
+            (lambda: setattr(self.image, "labels", None), "inventory.images.check", "label_mismatch"),
+            (lambda: self.image.labels.update({"name": self.CANARY}), "inventory.images.check", "name_mismatch"),
+            (lambda: setattr(self.volume, "labels", []), "inventory.volumes.check", "label_mismatch"),
+            (lambda: setattr(self.volume, "name", self.CANARY), "inventory.volumes.check", "name_mismatch"),
+            (lambda: setattr(self.volume, "type", self.CANARY), "inventory.volumes.check", "volume_type_mismatch"),
+            (lambda: setattr(self.volume, "size", self.CANARY), "inventory.volumes.check", "volume_size_mismatch"),
+            (lambda: setattr(self.clients.group.list_volumes, "return_value", [self.volume, self.volume]),
+             "inventory.volumes.count", "inventory_count"),
+            (lambda: setattr(self.clients.group.list_volumes, "return_value", []), "status.volume-count", "inventory_count"),
+            (lambda: setattr(self.clients.group.list_sandboxes, "return_value", []), "selection.sandbox", "inventory_count"),
+            (lambda: self.metadata.labels.update({"name": self.CANARY}), "selection.sandbox", "name_mismatch"),
+        ]
+        for mutate, operation, category in cases:
+            with self.subTest(operation=operation, category=category):
+                self.setUp()
+                mutate()
+                events = []
+                with (
+                    self.guest_mocks() as guest,
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(RuntimeError),
+                ):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertEqual(events[-1]["operation"], "hermes.status.v1." + operation)
+                self.assertEqual(events[-1]["error_category"], category)
+                self.assertNotIn(self.CANARY, json.dumps(events))
+                for call in guest:
+                    call.assert_not_called()
+                self.sandbox._dp_get.assert_not_called()
+                self.assert_no_mutations()
+
+    def test_mode_and_fresh_claim_mismatch_are_recorded_before_inventory(self):
+        for mode in ("", "hardened-unverified", self.CANARY):
+            with self.subTest(mode=mode):
+                events = []
+                with self.assertRaises(RuntimeError):
+                    test_hermes.inspect_deployment(
+                        config(egress_mode=mode), self.clients, capture=common.StatusRecorder(events.append),
+                    )
+                self.assertEqual(events[-1]["error_category"], "mode_mismatch")
+                self.assertNotIn(self.CANARY, json.dumps(events))
+        self.clients.credential.get_token.assert_not_called()
+        for name in ("tid", "oid", "idtyp", "aud"):
+            with self.subTest(claim=name):
+                self.setUp()
+                claims = {
+                    "tid": self.config.tenant_id, "oid": self.config.owner_object_id,
+                    "idtyp": "user", "aud": next(iter(common.INGRESS_AUDIENCES)),
+                }
+                claims[name] = self.CANARY
+                self.set_claims(claims)
+                events = []
+                with patch.object(common.logging.getLogger("hermes.egress"), "warning"), self.assertRaises(RuntimeError):
+                    test_hermes.inspect_deployment(self.config, self.clients, capture=common.StatusRecorder(events.append))
+                self.assertEqual(events[-1]["operation"], "hermes.status.v1.status.owner.claims")
+                self.assertEqual(events[-1]["error_category"], "claim_mismatch")
+                self.clients.resources.resource_groups.get.assert_not_called()
+                self.assertNotIn(self.CANARY, json.dumps(events))
+
+    def test_second_ownership_check_does_not_reuse_inventory_metadata(self):
+        cases = [
+            ("rg.labels", lambda: self.clients.resources.resource_groups.get,
+             SimpleNamespace(tags={}, location=self.config.location), "label_mismatch"),
+            ("rg.region", lambda: self.clients.resources.resource_groups.get,
+             SimpleNamespace(tags=self.config.labels, location=self.CANARY), "region_mismatch"),
+            ("group.labels", lambda: self.clients.groups.get_group,
+             SimpleNamespace(tags={}, location=self.config.location), "label_mismatch"),
+            ("group.region", lambda: self.clients.groups.get_group,
+             SimpleNamespace(tags=self.config.labels, location=self.CANARY), "region_mismatch"),
+            ("resources", lambda: self.clients.resources.resources.list_by_resource_group,
+             [SimpleNamespace(id=self.CANARY)], "foreign_resource"),
+        ]
+        for suffix, getter, changed, category in cases:
+            with self.subTest(subcheck=suffix):
+                self.setUp()
+                call = getter()
+                call.side_effect = [call.return_value, changed]
+                events = []
+                with (
+                    self.guest_mocks() as guest,
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(RuntimeError),
+                ):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertEqual(events[-1]["operation"], "hermes.status.v1.selection.ownership." + suffix)
+                self.assertEqual(events[-1]["error_category"], category)
+                for operation in guest:
+                    operation.assert_not_called()
+                self.sandbox._dp_get.assert_not_called()
+                self.assertNotIn(self.CANARY, json.dumps(events))
+
+    def test_collection_failure_retains_partial_count_and_does_not_claim_complete(self):
+        calls = [
+            ("inventory.sandboxes.list", lambda: self.clients.group.list_sandboxes, lambda: self.metadata),
+            ("inventory.images.list", lambda: self.clients.group.list_disk_images, lambda: self.image),
+            ("inventory.volumes.list", lambda: self.clients.group.list_volumes, lambda: self.volume),
+            ("inventory.ownership.resources", lambda: self.clients.resources.resources.list_by_resource_group,
+             lambda: SimpleNamespace(id=self.config.group_scope)),
+        ]
+        for operation, getter, item in calls:
+            with self.subTest(operation=operation):
+                self.setUp()
+
+                def interrupted_page():
+                    yield item()
+                    raise ServiceRequestError(self.CANARY)
+
+                getter().return_value = interrupted_page()
+                events = []
+                with patch.object(common.logging.getLogger("hermes.egress"), "warning"), self.assertRaises(ServiceRequestError):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertEqual(events[-1]["operation"], "hermes.status.v1." + operation)
+                self.assertEqual(events[-1]["error_category"], "transport")
+                self.assertEqual(events[-1]["details"]["count"], 1)
+                self.assertFalse(events[-1]["details"]["complete"])
+                self.assertNotIn(self.CANARY, json.dumps(events))
+                self.assert_no_mutations()
+
+    def test_foreign_arm_resource_stops_before_consuming_another_page(self):
+        continued = []
+
+        def resources():
+            yield SimpleNamespace(id=self.CANARY)
+            continued.append(True)
+            raise AssertionError("Foreign resource must stop iteration immediately.")
+
+        self.clients.resources.resources.list_by_resource_group.return_value = resources()
+        events = []
+        with patch.object(common.logging.getLogger("hermes.egress"), "warning"), self.assertRaises(RuntimeError):
+            self.inspect(common.StatusRecorder(events.append), precheck=False)
+        self.assertEqual(continued, [])
+        self.assertEqual(events[-1]["error_category"], "foreign_resource")
+        self.assertFalse(events[-1]["details"]["id_matches"])
+        self.assertFalse(events[-1]["details"]["complete"])
+        self.clients.group.list_sandboxes.assert_not_called()
+
+    def test_raw_get_response_is_committed_before_consistency_assertion(self):
+        for response, category in ((None, "malformed_type"), ([self.CANARY], "malformed_type"),
+                                   ({"id": self.CANARY}, "resource_mismatch")):
+            with self.subTest(kind=type(response).__name__):
+                self.setUp()
+                self.sandbox._dp_get.return_value = response
+                events = []
+                with (
+                    self.guest_mocks() as guest,
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(RuntimeError),
+                ):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertEqual(
+                    [(event["operation"], event["event"]) for event in events[-4:]],
+                    [("hermes.status.v1.status.raw." + operation, event)
+                     for operation, event in (("get", "begin"), ("get", "pass"), ("match", "begin"), ("match", "fail"))],
+                )
+                self.assertEqual(events[-1]["error_category"], category)
+                self.assertNotIn(self.CANARY, json.dumps(events))
+                for call in guest:
+                    call.assert_not_called()
+                self.assert_no_mutations()
+
+    def test_finite_transport_parser_permission_and_malformed_categories(self):
+        denied = HttpResponseError(self.CANARY)
+        denied.status_code = 403
+        notfound = HttpResponseError(self.CANARY)
+        notfound.status_code = 404
+        denied_auth = common.ClientAuthenticationError(self.CANARY)
+        denied_auth.status_code = 401
+        errors = [
+            (ResourceNotFoundError(self.CANARY), "notfound"),
+            (notfound, "notfound"), (denied, "permission"), (denied_auth, "permission"),
+            (ServiceRequestError(self.CANARY), "transport"),
+            (IncompleteReadError(self.CANARY), "transport"),
+            (TimeoutError(self.CANARY), "transport"), (json.JSONDecodeError(self.CANARY, self.CANARY, 0), "parser"),
+            (ValueError(self.CANARY), "parser"), (TypeError(self.CANARY), "malformed_type"),
+            (common.DecodeError(self.CANARY), "parser"), (common.DeserializationError(self.CANARY), "parser"),
+            (RuntimeError(self.CANARY), "unexpected"),
+        ]
+        for error, category in errors:
+            with self.subTest(category=category, kind=type(error).__name__):
+                self.setUp()
+                self.sandbox._dp_get.side_effect = error
+                events = []
+                with (
+                    self.guest_mocks() as guest,
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(type(error)) as raised,
+                ):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertIs(raised.exception, error)
+                self.assertEqual(events[-1]["operation"], "hermes.status.v1.status.raw.get")
+                self.assertEqual(events[-1]["error_category"], category)
+                self.assertNotIn("response_type", events[-1]["details"])
+                self.assertNotIn(self.CANARY, json.dumps(events))
+                for call in guest:
+                    call.assert_not_called()
+
+    def test_missing_or_malformed_sdk_collection_is_not_a_successful_empty_inventory(self):
+        for source in (None, 42, True, object()):
+            with self.subTest(kind=type(source).__name__):
+                self.setUp()
+                self.clients.group.list_volumes.return_value = source
+                events = []
+                with (
+                    self.guest_mocks() as guest,
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(TypeError),
+                ):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertEqual(events[-1]["operation"], "hermes.status.v1.inventory.volumes.list")
+                self.assertEqual(events[-1]["error_category"], "malformed_type")
+                self.assertFalse(events[-1]["details"]["complete"])
+                self.assertEqual(events[-1]["details"]["count"], 0)
+                for call in guest:
+                    call.assert_not_called()
+                self.assert_no_mutations()
+
+    def test_plain_callback_is_shared_across_the_whole_inspector(self):
+        events = []
+        with self.guest_mocks(), patch.object(common.logging.getLogger("hermes.egress"), "warning"):
+            test_hermes.inspect_deployment(self.config, self.clients, network=True, capture=events.append)
+        self.assertEqual([event["sequence"] for event in events], list(range(1, len(events) + 1)))
+        self.assertEqual(
+            [event["operation"] for event in events if event["event"] == "begin"],
+            ["hermes.status.v1." + name for name in self.ORDER[2:]],
+        )
+
+    def test_exact_volume_type_size_and_absent_null_are_not_normalized(self):
+        for field, values, category in (
+            ("type", ["datadisk", "DataDisk ", self.CANARY, None, [], {}], "volume_type_mismatch"),
+            ("size", ["1024Mi", "1GiB", "1073741824", 1073741824, True, self.CANARY, None, [], {}],
+             "volume_size_mismatch"),
+        ):
+            for value in values:
+                with self.subTest(field=field, kind=type(value).__name__):
+                    self.setUp()
+                    setattr(self.volume, field, value)
+                    events = []
+                    with patch.object(common.logging.getLogger("hermes.egress"), "warning"), self.assertRaises(RuntimeError):
+                        self.inspect(common.StatusRecorder(events.append), precheck=False)
+                    self.assertEqual(events[-1]["error_category"], category)
+                    self.assertNotIn(self.CANARY, json.dumps(events))
+                    self.assertNotIn("size_tag" if field == "size" else "volume_type_tag", events[-1]["details"])
+        for absent in (False, True):
+            with self.subTest(absent=absent):
+                self.setUp()
+                if absent:
+                    del self.volume.size
+                else:
+                    self.volume.size = None
+                events = []
+                with (
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaises(AttributeError if absent else RuntimeError),
+                ):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                self.assertEqual(events[-1]["details"]["size_present"], not absent)
+                self.assertEqual(events[-1]["details"]["size_type"], "absent" if absent else "null")
+
+    def test_current_sdk_name_aliases_string_enums_and_region_spelling_still_work(self):
+        from azure.containerapps.sandbox._models import Volume
+
+        class DiskKind(str, Enum):
+            DATA = "DataDisk"
+
+        for name in ("name", "volumeName"):
+            with self.subTest(name_field=name):
+                self.setUp()
+                self.rg.location = "Sweden Central"
+                self.group.location = "SWEDEN CENTRAL"
+                self.clients.group.list_volumes.return_value = [Volume._from_dict({
+                    name: self.config.volume_name, "type": DiskKind.DATA, "size": "1Gi", "labels": self.config.labels,
+                })]
+                events = []
+                with self.guest_mocks(), patch.object(common.logging.getLogger("hermes.egress"), "warning"):
+                    self.inspect(common.StatusRecorder(events.append), precheck=False)
+                observed = next(event for event in events if event["operation"].endswith("inventory.volumes.check"))
+                self.assertEqual(observed["details"]["volume_type_tag"], "DataDisk")
+                self.assertEqual(observed["details"]["size_tag"], "1Gi")
+
+    def test_current_inventory_permits_old_owned_images_without_digest_assertion(self):
+        old = SimpleNamespace(labels=dict(self.image.labels), image=SimpleNamespace(base=self.CANARY))
+        self.clients.group.list_disk_images.return_value = [old, self.image]
+        events = []
+        with self.guest_mocks(), patch.object(common.logging.getLogger("hermes.egress"), "warning"):
+            self.inspect(common.StatusRecorder(events.append), precheck=False)
+        checked = [event for event in events if event["operation"].endswith("inventory.images.check") and event["event"] == "pass"]
+        self.assertEqual([event["details"]["item_index"] for event in checked], [0, 1])
+        self.assertEqual([event["details"]["base_digest_matches"] for event in checked], [False, True])
+        self.assertNotIn(self.CANARY, json.dumps(events))
+
+    def test_policy_commit_and_validator_return_are_distinct(self):
+        events = []
+        with self.assertLogs("hermes.egress", level="WARNING"):
+            common.validate_egress(
+                self.raw, common.deployment_egress(self.config), status_capture=common.StatusRecorder(events.append),
+            )
+        self.assertEqual(events[0]["details"]["snapshot"]["validation"], "NOT EVALUATED")
+        self.assertTrue(events[1]["details"]["capture_committed"])
+        self.assertNotIn("validator_returned", events[1]["details"])
+        self.assertTrue(events[3]["details"]["validator_returned"])
+        self.raw["egressPolicy"]["http"]["trafficInspection"] = "Full"
+        events.clear()
+        with self.assertLogs("hermes.egress", level="WARNING"), self.assertRaises(RuntimeError):
+            common.validate_egress(
+                self.raw, common.deployment_egress(self.config), status_capture=common.StatusRecorder(events.append),
+            )
+        self.assertEqual(events[-1]["event"], "fail")
+        self.assertEqual(events[-1]["error_category"], "policy_mismatch")
+        self.assertNotIn("validator_returned", events[-1]["details"])
+
+    def test_capture_failure_blocks_before_owner_and_suppresses_sink_canary(self):
+        with self.guest_mocks() as guest:
+            with self.assertRaises(common.StatusCaptureError) as raised:
+                test_hermes.inspect_deployment(
+                    self.config, self.clients, capture=MagicMock(side_effect=OSError(self.CANARY)),
+                )
+            self.assertEqual(raised.exception.error_category, "capture_persistence")
+            self.assertEqual(raised.exception.operation, "hermes.status.v1.status.mode")
+            self.assertNotIn(self.CANARY, str(raised.exception))
+            self.clients.credential.get_token.assert_not_called()
+            for operation in guest:
+                operation.assert_not_called()
+            self.sandbox._dp_put.assert_not_called()
+            self.sandbox._dp_post.assert_not_called()
+
+    def test_unknown_service_values_are_only_shape_and_match_flags(self):
+        self.rg.tags[self.CANARY] = self.CANARY
+        self.group.identity = {"type": self.CANARY, "principalId": self.CANARY, "header": self.CANARY}
+        self.image.image.base = "https://" + self.CANARY + ".invalid/?token=" + self.CANARY
+        self.raw["egressPolicy"]["metadata"] = {"url": self.CANARY}
+        events = []
+        with self.guest_mocks(), self.assertLogs("hermes.egress", level="WARNING") as logged:
+            self.inspect(common.StatusRecorder(events.append))
+        encoded = json.dumps(events)
+        for private in (
+            self.CANARY, self.token, self.config.owner_object_id, self.config.tenant_id,
+            self.config.whatsapp_phone, self.config.group_scope, self.config.image, self.config.foundry_endpoint,
+            self.sandbox.sandbox_id,
+        ):
+            self.assertNotIn(private, encoded)
+        self.assertNotIn(self.CANARY, "\n".join(logged.output))
+        image = next(event for event in events if event["operation"].endswith("inventory.images.check"))
+        self.assertFalse(image["details"]["base_digest_matches"])
+
+    def test_nonobject_claims_and_unhashable_audience_use_owner_runtime_error(self):
+        for claims in ([], None, "private-value", 123, {
+            "tid": self.config.tenant_id, "oid": self.config.owner_object_id, "idtyp": "user", "aud": [],
+        }):
+            with self.subTest(kind=type(claims).__name__):
+                self.set_claims(claims)
+                with self.assertRaisesRegex(RuntimeError, "configured owner"):
+                    common.assert_owner(self.clients.credential, self.config)
+
+    def test_durable_policy_capture_ack_precedes_validator_call(self):
+        original = common._checked_egress
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.touch(mode=0o600)
+
+            def persist(event):
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(event) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+            def validate(*args):
+                persisted = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual(persisted[-2]["event"], "pass")
+                self.assertTrue(persisted[-2]["details"]["capture_committed"])
+                self.assertEqual(persisted[-1]["operation"], "hermes.status.v1.precheck.policy.validate")
+                self.assertEqual(persisted[-1]["event"], "begin")
+                return original(*args)
+
+            with patch.object(common, "_checked_egress", side_effect=validate), self.assertLogs("hermes.egress", level="WARNING"):
+                common.validate_egress(
+                    self.raw, common.deployment_egress(self.config), status_capture=common.StatusRecorder(persist),
+                )
+            persisted = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertTrue(persisted[-1]["details"]["validator_returned"])
+
+    def test_legacy_policy_capture_failure_has_no_commit_or_validator_return_ack(self):
+        events = []
+        with (
+            patch.object(common, "_checked_egress") as predicate,
+            patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+            self.assertRaises(RuntimeError),
+        ):
+            common.validate_egress(
+                self.raw, common.deployment_egress(self.config),
+                capture=MagicMock(side_effect=OSError(self.CANARY)), status_capture=common.StatusRecorder(events.append),
+            )
+        predicate.assert_not_called()
+        self.assertEqual([event["event"] for event in events], ["begin", "fail"])
+        self.assertEqual(events[-1]["error_category"], "capture_persistence")
+        self.assertNotIn("capture_committed", events[-1]["details"])
+        self.assertNotIn(self.CANARY, json.dumps(events))
+
+    def test_async_or_nonvoid_sinks_cannot_report_durable_success(self):
+        invoked = []
+
+        async def asynchronous(_event):
+            invoked.append(self.CANARY)
+
+        for sink in (asynchronous, lambda _event: True, lambda _event: self.CANARY):
+            with self.subTest(sink=sink):
+                with self.assertRaises(common.StatusCaptureError):
+                    test_hermes.inspect_deployment(self.config, self.clients, capture=sink)
+                with (
+                    patch.object(common, "_checked_egress") as predicate,
+                    patch.object(common.logging.getLogger("hermes.egress"), "warning"),
+                    self.assertRaisesRegex(RuntimeError, "capture") as raised,
+                ):
+                    common.validate_egress(self.raw, common.deployment_egress(self.config), capture=sink)
+                predicate.assert_not_called()
+                self.assertNotIn(self.CANARY, str(raised.exception))
+        self.assertEqual(invoked, [])
+        self.clients.credential.get_token.assert_not_called()
+
+    def test_evidence_schema_rejects_arbitrary_keys_strings_and_deep_shapes(self):
+        cyclic = {}
+        cyclic["fields"] = cyclic
+        for details in (
+            {self.CANARY: True}, {"name_type": self.CANARY}, {"count": self.CANARY},
+            {"count": -1}, {"count": 2**53}, {"count": 0.5}, {"fields": [self.CANARY]}, cyclic,
+        ):
+            with self.subTest(shape=type(details).__name__):
+                events = []
+                with self.assertRaises(common.StatusCaptureError) as raised:
+                    with common.StatusRecorder(events.append).step("status.mode", details=details):
+                        self.fail("Unsafe evidence must fail before acceptance.")
+                self.assertEqual(events, [])
+                self.assertNotIn(self.CANARY, str(raised.exception))
+
+    def test_mutating_a_sink_record_cannot_change_live_predicates_or_later_records(self):
+        events = []
+
+        def sink(event):
+            events.append(copy.deepcopy(event))
+            event["details"].clear()
+            event["details"][self.CANARY] = self.CANARY
+
+        with self.guest_mocks(), patch.object(common.logging.getLogger("hermes.egress"), "warning"):
+            self.inspect(common.StatusRecorder(sink))
+        self.assertNotIn(self.CANARY, json.dumps(events))
+        self.assertTrue(events[1]["details"]["capture_committed"])
+        self.assertTrue(events[3]["details"]["validator_returned"])
+
+
 class EgressStatusAndAccessTests(unittest.TestCase):
     def setUp(self):
         self.config = config()
@@ -1207,9 +1972,18 @@ class DeploymentRollbackTests(unittest.TestCase):
         self.mocks["upload_private_file"].assert_not_called()
 
     def test_deploy_forwards_the_same_capture_sink_to_the_network_precheck(self):
-        sink = MagicMock()
+        sink = MagicMock(return_value=None)
         self.assertEqual(deploy_hermes.deploy(self.config, self.clients, egress_capture=sink), "new-sandbox")
         self.mocks["verify_mvp_network"].assert_called_once_with(self.sandbox, self.config, capture=sink)
+
+    def test_status_capture_error_remains_a_fail_closed_deployment_error(self):
+        error = common.StatusCaptureError("hermes.status.v1.network.raw.get", "begin")
+        self.mocks["verify_mvp_network"].side_effect = error
+        with self.assertRaises(common.StatusCaptureError) as raised:
+            deploy_hermes.deploy(self.config, self.clients)
+        self.assertIs(raised.exception, error)
+        self.assert_rolled_back_without_data_deletion()
+        self.mocks["configure_port"].assert_not_called()
 
     def test_third_get_drift_is_captured_before_rollback_without_guest_execution(self):
         self.mocks["verify_mvp_network"].side_effect = common.verify_mvp_network

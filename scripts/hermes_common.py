@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import logging
 import os
@@ -11,7 +12,9 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Callable
+from asyncio import CancelledError
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -23,7 +26,10 @@ from azure.containerapps.sandbox import (
     SandboxGroupManagementClient,
     endpoint_for_region,
 )
-from azure.core.exceptions import AzureError, HttpResponseError, ResourceNotFoundError
+from azure.core.exceptions import (
+    AzureError, ClientAuthenticationError, DecodeError, DeserializationError, HttpResponseError, IncompleteReadError,
+    ResourceNotFoundError, ServiceRequestError, ServiceResponseError,
+)
 from azure.identity import AzureCliCredential
 from azure.mgmt.resource import ResourceManagementClient
 
@@ -396,19 +402,259 @@ class AzureClients:
         self.credential.close()
 
 
-def assert_owner(credential: AzureCliCredential, config: Config) -> None:
-    token = credential.get_token(INGRESS_SCOPE).token
-    try:
-        payload = token.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        valid = (
-            claims.get("tid") == config.tenant_id and claims.get("oid") == config.owner_object_id
-            and claims.get("idtyp") == "user" and claims.get("aud") in INGRESS_AUDIENCES
-        )
-    except (ValueError, IndexError, UnicodeDecodeError):
-        valid = False
-    if not valid:
-        raise RuntimeError("Azure CLI must be signed in as the configured owner in the configured tenant.")
+_STATUS_PREFIX = "hermes.status.v1."
+STATUS_OPERATION_IDS = frozenset(_STATUS_PREFIX + name for name in (
+    {
+        "status.mode", "status.owner.credential", "status.owner.claims", "status.volume-count",
+        "inventory.images.list", "inventory.volumes.list", "inventory.sandboxes.count",
+        "inventory.images.check", "inventory.volumes.check", "inventory.volumes.count",
+        "selection.sandbox", "selection.client", "status.lifecycle", "status.ports",
+        "status.runtime", "status.access-key", "status.control", "network.https",
+    }
+    | {f"{scope}.policy.{step}" for scope in ("precheck", "status", "network") for step in ("capture", "validate")}
+    | {f"{scope}.raw.{step}" for scope in ("status", "network") for step in ("get", "match")}
+    | {
+        f"{scope}.ownership.{step}" for scope in ("inventory", "selection")
+        for step in ("rg.get", "rg.labels", "rg.region", "group.get", "group.labels", "group.region", "resources")
+    }
+    | {f"{scope}.sandboxes.{step}" for scope in ("inventory", "selection") for step in ("list", "labels")}
+))
+STATUS_ERROR_CATEGORIES = frozenset({
+    "credential", "claim_mismatch", "notfound", "permission", "malformed_type", "parser",
+    "label_mismatch", "region_mismatch", "foreign_resource", "inventory_count", "name_mismatch",
+    "volume_type_mismatch", "volume_size_mismatch", "transport", "service_error", "capture_persistence",
+    "interrupted", "policy_mismatch", "mode_mismatch", "resource_mismatch", "lifecycle_mismatch",
+    "ingress_mismatch", "runtime_mismatch", "private_key_shape", "runtime_status", "guest_exec",
+    "network_tls", "unexpected",
+})
+_STATUS_FIELDS = frozenset({
+    "snapshot", "capture_committed", "validator_returned", "capture_supplied",
+    "schema_version", "schema_api_version", "schema_commit", "schema_model_sha256", "operation",
+    "validation", "outbound_isolation", "response_type", "policy", "present", "type", "count",
+    "public_enum", "fields", "unclassified_field_count", "defaultForward",
+    "source_type", "complete", "item_index", "labels_type", "labels_count", "label_matches",
+    "managed-by", "hermes-deployment", "hermes-owner-tenant-id", "hermes-owner-object-id",
+    "location_type", "location_matches", "id_type", "id_matches", "identity_present", "identity_type",
+    "identity_kind_type", "system_assigned_matches", "principal_present", "principal_type",
+    "principal_id_shape_matches", "name_present", "name_type", "name_matches", "base_type",
+    "base_digest_matches", "volume_type_present", "volume_type", "volume_type_matches", "volume_type_tag",
+    "size_present", "size_type", "size_matches", "size_tag", "config_mode_matches", "token_acquired",
+    "claims_type", "tenant_matches", "owner_matches", "user_type_matches", "audience_matches",
+    "runtime_matches", "key_checked", "control_checked", "connected_hosts_count",
+}) | _EGRESS_ROOT_FIELDS | _EGRESS_BLOCKED_FIELDS
+_STATUS_LITERALS = frozenset({
+    "absent", "null", "boolean", "string", "object", "array", "number", "unsupported", "iterable",
+    "DataDisk", "1Gi", "create", "get", "NOT EVALUATED",
+    EGRESS_SCHEMA_VERSION, EGRESS_SCHEMA_COMMIT, EGRESS_SCHEMA_MODEL_SHA256,
+}) | frozenset(literal for literals in _EGRESS_ENUMS.values() for literal in literals)
+
+
+def _safe_status_value(value: Any, depth: int = 0) -> bool:
+    if depth > 8:
+        return False
+    if value is None or type(value) is bool:
+        return True
+    if type(value) is int:
+        return 0 <= value <= 2**53 - 1
+    if type(value) is str:
+        return value in _STATUS_LITERALS
+    return type(value) is dict and len(value) <= 128 and all(
+        type(key) is str and key in _STATUS_FIELDS and _safe_status_value(child, depth + 1)
+        for key, child in value.items()
+    )
+
+
+def _require_sync_capture(result: Any) -> None:
+    if inspect.iscoroutine(result):
+        result.close()
+    if result is not None:
+        raise RuntimeError("A synchronous capture sink must persist before returning None.")
+
+
+class StatusCaptureError(RuntimeError):
+    def __init__(self, operation: str, event: str, prior_error_category: str | None = None):
+        super().__init__("BLOCKED: status evidence capture failed; inspection stopped. Details suppressed.")
+        self.operation = operation
+        self.event = event
+        self.error_category = "capture_persistence"
+        self.prior_error_category = prior_error_category
+
+
+def _status_error_category(error: BaseException, fallback: str) -> str:
+    if isinstance(error, StatusCaptureError):
+        return "capture_persistence"
+    if isinstance(error, (KeyboardInterrupt, SystemExit, CancelledError)):
+        return "interrupted"
+    if fallback == "capture_persistence":
+        return fallback
+    if isinstance(error, ResourceNotFoundError):
+        return "notfound"
+    if isinstance(error, IncompleteReadError):
+        return "transport"
+    if isinstance(error, (json.JSONDecodeError, DecodeError, DeserializationError)):
+        return "parser"
+    if isinstance(error, HttpResponseError) and error.status_code in (401, 403, 404):
+        return "notfound" if error.status_code == 404 else "permission"
+    if isinstance(error, ClientAuthenticationError):
+        return "credential"
+    if isinstance(error, HttpResponseError):
+        return "service_error"
+    if isinstance(error, (ServiceRequestError, ServiceResponseError, OSError)):
+        return "transport"
+    if isinstance(error, AzureError):
+        return "service_error"
+    if isinstance(error, (TypeError, AttributeError)):
+        return "malformed_type"
+    if isinstance(error, ValueError) and fallback == "unexpected":
+        return "parser"
+    return fallback
+
+
+@dataclass
+class _StatusStep:
+    details: dict[str, Any]
+    error_category: str
+
+
+class StatusRecorder:
+    """One ordered inspection stream; a synchronous sink must persist or raise."""
+
+    def __init__(self, sink: Callable[[dict[str, Any]], None] | None = None):
+        self.sink = sink
+        self.sequence = 0
+        self._failure: StatusCaptureError | None = None
+
+    @classmethod
+    def coerce(cls, capture: StatusSink) -> StatusRecorder:
+        return capture if isinstance(capture, cls) else cls(capture)
+
+    def options(self, prefix: str | None = None) -> dict[str, Any]:
+        if self.sink is None:
+            return {}
+        result: dict[str, Any] = {"status_capture": self}
+        if prefix is not None:
+            result["_status_prefix"] = prefix
+        return result
+
+    def _emit(self, operation: str, event: str, details: dict[str, Any], error_category: str | None = None) -> None:
+        if self.sink is None:
+            return
+        if self._failure is not None:
+            raise self._failure
+        try:
+            if not _safe_status_value(details) or (
+                error_category is not None and error_category not in STATUS_ERROR_CATEGORIES
+            ):
+                raise ValueError("Invalid status evidence schema.")
+            self.sequence += 1
+            record = {
+                "schema_version": 1, "sequence": self.sequence, "operation": operation, "event": event,
+                "details": json.loads(json.dumps(details)),
+            }
+            if error_category is not None:
+                record["error_category"] = error_category
+            if inspect.iscoroutinefunction(self.sink):
+                raise ValueError("Status capture must be synchronous.")
+            _require_sync_capture(self.sink(record))
+        except Exception:
+            self._failure = StatusCaptureError(operation, event, error_category)
+            raise self._failure from None
+
+    @contextmanager
+    def step(
+        self, operation: str, *, error_category: str = "unexpected", details: dict[str, Any] | None = None,
+    ) -> Iterator[_StatusStep]:
+        operation = _STATUS_PREFIX + operation
+        if operation not in STATUS_OPERATION_IDS or error_category not in STATUS_ERROR_CATEGORIES:
+            raise ValueError("Unrecognized status operation or error category.")
+        step = _StatusStep(details={} if details is None else details, error_category=error_category)
+        self._emit(operation, "begin", step.details)
+        try:
+            yield step
+        except BaseException as error:
+            self._emit(operation, "fail", step.details, _status_error_category(error, step.error_category))
+            raise
+        self._emit(operation, "pass", step.details)
+
+
+StatusSink = StatusRecorder | Callable[[dict[str, Any]], None] | None
+
+
+def _status_labels(labels: Any, config: Config) -> dict[str, Any]:
+    return {
+        "labels_type": _egress_value_type(labels), "labels_count": len(labels) if isinstance(labels, dict) else 0,
+        "label_matches": {
+            key: isinstance(labels, dict) and labels.get(key) == value for key, value in config.labels.items()
+        },
+    }
+
+
+def _status_name(labels: Any, expected: str) -> dict[str, Any]:
+    return {
+        "name_present": isinstance(labels, dict) and "name" in labels,
+        "name_type": _egress_value_type(labels.get("name")) if isinstance(labels, dict) and "name" in labels else "absent",
+        "name_matches": isinstance(labels, dict) and labels.get("name") == expected,
+    }
+
+
+def _status_identity(group: Any) -> dict[str, Any]:
+    identity = getattr(group, "identity", None)
+    fields = identity if isinstance(identity, dict) else {}
+    principal = fields.get("principalId")
+    return {
+        "identity_present": hasattr(group, "identity"), "identity_type": _egress_value_type(identity),
+        "identity_kind_type": _egress_value_type(fields.get("type")) if "type" in fields else "absent",
+        "system_assigned_matches": fields.get("type") == "SystemAssigned",
+        "principal_present": "principalId" in fields,
+        "principal_type": _egress_value_type(principal) if "principalId" in fields else "absent",
+        "principal_id_shape_matches": isinstance(principal, str) and bool(re.fullmatch(
+            r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", principal,
+        )),
+    }
+
+
+def _status_list(trace: StatusRecorder, operation: str, read: Callable[[], Iterable[Any]]) -> list[Any]:
+    with trace.step(operation, details={"count": 0, "complete": False}) as step:
+        source = read()
+        step.details["source_type"] = _egress_value_type(source)
+        if step.details["source_type"] == "unsupported" and isinstance(source, Iterable):
+            step.details["source_type"] = "iterable"
+        result = []
+        for item in source:
+            result.append(item)
+            step.details["count"] += 1
+        step.details["complete"] = True
+    return result
+
+
+def assert_owner(credential: AzureCliCredential, config: Config, *, status_capture: StatusSink = None) -> None:
+    trace = StatusRecorder.coerce(status_capture)
+    with trace.step("status.owner.credential", error_category="credential") as step:
+        token = credential.get_token(INGRESS_SCOPE).token
+        step.details["token_acquired"] = True
+    with trace.step("status.owner.claims", error_category="claim_mismatch") as step:
+        try:
+            payload = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            step.details["claims_type"] = _egress_value_type(claims)
+            if isinstance(claims, dict):
+                step.details.update({
+                    "tenant_matches": claims.get("tid") == config.tenant_id,
+                    "owner_matches": claims.get("oid") == config.owner_object_id,
+                    "user_type_matches": claims.get("idtyp") == "user",
+                    "audience_matches": isinstance(claims.get("aud"), str) and claims["aud"] in INGRESS_AUDIENCES,
+                })
+                valid = all(step.details[name] for name in (
+                    "tenant_matches", "owner_matches", "user_type_matches", "audience_matches",
+                ))
+            else:
+                step.error_category = "malformed_type"
+                valid = False
+        except (ValueError, IndexError, UnicodeDecodeError):
+            step.error_category = "parser"
+            valid = False
+        if not valid:
+            raise RuntimeError("Azure CLI must be signed in as the configured owner in the configured tenant.")
 
 
 def assert_labels(labels: Any, config: Config, kind: str) -> None:
@@ -416,39 +662,107 @@ def assert_labels(labels: Any, config: Config, kind: str) -> None:
         raise RuntimeError(f"Refusing to adopt or change an unowned {kind}.")
 
 
-def assert_group_owned(config: Config, clients: AzureClients) -> None:
-    rg = clients.resources.resource_groups.get(config.resource_group)
-    assert_labels(rg.tags, config, "resource group")
-    if rg.location.replace(" ", "").lower() != config.location:
-        raise RuntimeError("Resource group region differs from the configured region.")
-    group = clients.groups.get_group(config.sandbox_group)
-    assert_labels(group.tags, config, "Sandbox Group")
-    if group.location.replace(" ", "").lower() != config.location:
-        raise RuntimeError("Sandbox Group region differs from the configured region.")
-    for resource in clients.resources.resources.list_by_resource_group(config.resource_group):
-        if resource.id.lower() != config.group_scope.lower():
-            raise RuntimeError("Resource group contains foreign resources; it is not a dedicated Hermes group.")
+def assert_group_owned(
+    config: Config, clients: AzureClients, *, status_capture: StatusSink = None,
+    _status_prefix: Literal["inventory.ownership", "selection.ownership"] = "inventory.ownership",
+) -> None:
+    trace = StatusRecorder.coerce(status_capture)
+    with trace.step(f"{_status_prefix}.rg.get"):
+        rg = clients.resources.resource_groups.get(config.resource_group)
+    with trace.step(
+        f"{_status_prefix}.rg.labels", error_category="label_mismatch",
+        details=_status_labels(getattr(rg, "tags", None), config),
+    ):
+        assert_labels(rg.tags, config, "resource group")
+    location = getattr(rg, "location", None)
+    with trace.step(f"{_status_prefix}.rg.region", error_category="region_mismatch", details={
+        "location_type": _egress_value_type(location),
+        "location_matches": isinstance(location, str) and location.replace(" ", "").lower() == config.location,
+    }):
+        if rg.location.replace(" ", "").lower() != config.location:
+            raise RuntimeError("Resource group region differs from the configured region.")
+    with trace.step(f"{_status_prefix}.group.get") as step:
+        group = clients.groups.get_group(config.sandbox_group)
+        step.details.update(_status_identity(group))
+    with trace.step(
+        f"{_status_prefix}.group.labels", error_category="label_mismatch",
+        details=_status_labels(getattr(group, "tags", None), config),
+    ):
+        assert_labels(group.tags, config, "Sandbox Group")
+    location = getattr(group, "location", None)
+    with trace.step(f"{_status_prefix}.group.region", error_category="region_mismatch", details={
+        "location_type": _egress_value_type(location),
+        "location_matches": isinstance(location, str) and location.replace(" ", "").lower() == config.location,
+    }):
+        if group.location.replace(" ", "").lower() != config.location:
+            raise RuntimeError("Sandbox Group region differs from the configured region.")
+    with trace.step(
+        f"{_status_prefix}.resources", details={"count": 0, "complete": False},
+    ) as step:
+        for resource in clients.resources.resources.list_by_resource_group(config.resource_group):
+            step.details["count"] += 1
+            resource_id = getattr(resource, "id", None)
+            step.details.update({
+                "id_type": _egress_value_type(resource_id),
+                "id_matches": isinstance(resource_id, str) and resource_id.lower() == config.group_scope.lower(),
+            })
+            step.error_category = "foreign_resource"
+            if resource.id.lower() != config.group_scope.lower():
+                raise RuntimeError("Resource group contains foreign resources; it is not a dedicated Hermes group.")
+            step.error_category = "unexpected"
+        step.details["complete"] = True
 
 
-def owned_sandboxes(config: Config, clients: AzureClients) -> list[Any]:
-    sandboxes = list(clients.group.list_sandboxes())
-    for sandbox in sandboxes:
-        assert_labels(sandbox.labels, config, "sandbox")
+def owned_sandboxes(
+    config: Config, clients: AzureClients, *, status_capture: StatusSink = None,
+    _status_prefix: Literal["inventory", "selection"] = "inventory",
+) -> list[Any]:
+    trace = StatusRecorder.coerce(status_capture)
+    sandboxes = _status_list(trace, f"{_status_prefix}.sandboxes.list", clients.group.list_sandboxes)
+    for index, sandbox in enumerate(sandboxes):
+        with trace.step(
+            f"{_status_prefix}.sandboxes.labels", error_category="label_mismatch",
+            details={"item_index": index, **_status_labels(getattr(sandbox, "labels", None), config)},
+        ):
+            assert_labels(sandbox.labels, config, "sandbox")
     return sandboxes
 
 
-def get_sandbox(config: Config, clients: AzureClients) -> SandboxClient:
-    assert_group_owned(config, clients)
-    sandboxes = owned_sandboxes(config, clients)
-    if len(sandboxes) != 1 or sandboxes[0].labels.get("name") != config.sandbox_name:
-        raise RuntimeError("Expected exactly one owned Hermes sandbox. Run deploy_hermes.py explicitly.")
-    return clients.group.get_sandbox_client(sandboxes[0].id)
+def get_sandbox(config: Config, clients: AzureClients, *, status_capture: StatusSink = None) -> SandboxClient:
+    trace = StatusRecorder.coerce(status_capture)
+    assert_group_owned(config, clients, **trace.options("selection.ownership"))
+    sandboxes = owned_sandboxes(config, clients, **trace.options("selection"))
+    with trace.step("selection.sandbox", error_category="inventory_count", details={
+        "count": len(sandboxes),
+        **_status_name(getattr(sandboxes[0], "labels", None) if sandboxes else None, config.sandbox_name),
+    }) as step:
+        if len(sandboxes) != 1:
+            raise RuntimeError("Expected exactly one owned Hermes sandbox. Run deploy_hermes.py explicitly.")
+        step.error_category = "name_mismatch"
+        if sandboxes[0].labels.get("name") != config.sandbox_name:
+            raise RuntimeError("Expected exactly one owned Hermes sandbox. Run deploy_hermes.py explicitly.")
+    with trace.step("selection.client", error_category="malformed_type"):
+        sandbox = clients.group.get_sandbox_client(sandboxes[0].id)
+    return sandbox
 
 
-def raw_sandbox(sandbox: SandboxClient) -> dict[str, Any]:
-    raw = sandbox._dp_get(sandbox._sbx_path)
-    if not isinstance(raw, dict) or raw.get("id") != sandbox.sandbox_id:
-        raise RuntimeError("Sandbox API returned inconsistent metadata.")
+def raw_sandbox(
+    sandbox: SandboxClient, *, status_capture: StatusSink = None,
+    _status_prefix: Literal["status.raw", "network.raw"] = "status.raw",
+) -> dict[str, Any]:
+    trace = StatusRecorder.coerce(status_capture)
+    with trace.step(f"{_status_prefix}.get") as step:
+        raw = sandbox._dp_get(sandbox._sbx_path)
+        step.details["response_type"] = _egress_value_type(raw)
+    with trace.step(f"{_status_prefix}.match", error_category="resource_mismatch", details={
+        "response_type": _egress_value_type(raw),
+        "id_type": _egress_value_type(raw.get("id")) if isinstance(raw, dict) else "absent",
+        "id_matches": isinstance(raw, dict) and raw.get("id") == sandbox.sandbox_id,
+    }) as step:
+        if not isinstance(raw, dict):
+            step.error_category = "malformed_type"
+        if not isinstance(raw, dict) or raw.get("id") != sandbox.sandbox_id:
+            raise RuntimeError("Sandbox API returned inconsistent metadata.")
     return raw
 
 
@@ -624,19 +938,37 @@ def _validate_enforcement_mode(policy: dict, location: str) -> None:
 def validate_egress(
     raw: Any, expected: dict[str, Any], *, operation: Literal["create", "get"] = "get",
     capture: Callable[[dict[str, Any]], None] | None = None,
+    status_capture: StatusSink = None,
+    _status_prefix: Literal["precheck.policy", "status.policy", "network.policy"] = "precheck.policy",
 ) -> dict[str, Any]:
     """Capture before checking; a supplied durable sink must persist or raise."""
+    trace = StatusRecorder.coerce(status_capture)
     observation = egress_policy_observation(raw, operation=operation)
-    logging.getLogger("hermes.egress").warning(
-        "MVP policy observation before validation (no outbound isolation): %s",
-        json.dumps(observation, sort_keys=True),
-    )
-    if capture is not None:
-        try:
-            capture(observation)
-        except Exception:
-            # A persistence failure must block acceptance without exposing sink paths or content.
-            raise RuntimeError("BLOCKED: redacted egress capture failed; policy acceptance refused. Details suppressed.") from None
+    with trace.step(f"{_status_prefix}.capture", error_category="capture_persistence", details={
+        "snapshot": observation, "capture_supplied": capture is not None,
+    }) as step:
+        logging.getLogger("hermes.egress").warning(
+            "MVP policy observation before validation (no outbound isolation): %s",
+            json.dumps(observation, sort_keys=True),
+        )
+        if capture is not None:
+            try:
+                if inspect.iscoroutinefunction(capture):
+                    raise ValueError("Egress capture must be synchronous.")
+                _require_sync_capture(capture(observation))
+            except Exception:
+                raise RuntimeError(
+                    "BLOCKED: redacted egress capture failed; policy acceptance refused. Details suppressed."
+                ) from None
+        step.details.pop("snapshot")
+        step.details["capture_committed"] = trace.sink is not None or capture is not None
+    with trace.step(f"{_status_prefix}.validate", error_category="policy_mismatch") as step:
+        result = _checked_egress(raw, expected, observation)
+        step.details["validator_returned"] = True
+    return result
+
+
+def _checked_egress(raw: Any, expected: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
     if expected != egress_document(MVP_EGRESS_MODE):
         raise RuntimeError("BLOCKED: expected egress request must be exactly None + Allow, without rules.")
     policy = raw.get("egressPolicy") if isinstance(raw, dict) else None
@@ -961,23 +1293,32 @@ print(json.dumps(results))
 def verify_mvp_network(
     sandbox: SandboxClient, config: Config, *,
     capture: Callable[[dict[str, Any]], None] | None = None,
+    status_capture: StatusSink = None,
 ) -> dict[str, Any]:
+    trace = StatusRecorder.coerce(status_capture)
     policy = deployment_egress(config)
-    validate_egress(raw_sandbox(sandbox), policy, capture=capture)
+    validate_egress(
+        raw_sandbox(sandbox, **trace.options("network.raw")), policy,
+        capture=capture, **trace.options("network.policy"),
+    )
     hosts = ["example.com"]
-    result = parse_json(exec_checked(
-        sandbox, [PYTHON, "-c", _NETWORK_PROBE, json.dumps(hosts)]
-    ).encode())
-    if (
-        not isinstance(result, dict) or set(result) != set(hosts)
-        or any(
-            not isinstance(result[host], dict) or set(result[host]) != {"public_ca_tls", "http_status"}
-            or result[host]["public_ca_tls"] is not True
-            or type(result[host]["http_status"]) is not int or not 100 <= result[host]["http_status"] <= 599
-            for host in hosts
-        )
-    ):
-        raise RuntimeError("MVP network check failed verified public-CA HTTPS; no alternate trust or policy was tried.")
+    with trace.step("network.https", error_category="guest_exec") as step:
+        output = exec_checked(sandbox, [PYTHON, "-c", _NETWORK_PROBE, json.dumps(hosts)])
+        step.error_category = "parser"
+        result = parse_json(output.encode())
+        step.details["response_type"] = _egress_value_type(result)
+        step.error_category = "network_tls"
+        if (
+            not isinstance(result, dict) or set(result) != set(hosts)
+            or any(
+                not isinstance(result[host], dict) or set(result[host]) != {"public_ca_tls", "http_status"}
+                or result[host]["public_ca_tls"] is not True
+                or type(result[host]["http_status"]) is not int or not 100 <= result[host]["http_status"] <= 599
+                for host in hosts
+            )
+        ):
+            raise RuntimeError("MVP network check failed verified public-CA HTTPS; no alternate trust or policy was tried.")
+        step.details["connected_hosts_count"] = len(hosts)
     return {
         "egress_mode": MVP_EGRESS_MODE, "traffic_inspection": "None", "default_action": "Allow",
         "outbound_isolation": False, "public_ca_tls_hosts": hosts, "all_destinations_tested": False,
@@ -989,21 +1330,58 @@ def confirm_target(config: Config, value: str | None) -> None:
         raise ValueError(f"Pass --confirm-target with the exact intended Sandbox Group resource ID: {config.group_scope}")
 
 
-def owned_inventory(config: Config, clients: AzureClients) -> tuple[list[Any], list[Any], list[Any]]:
-    assert_group_owned(config, clients)
-    sandboxes = owned_sandboxes(config, clients)
-    images = list(clients.group.list_disk_images())
-    volumes = list(clients.group.list_volumes())
-    if len(sandboxes) > 1:
-        raise RuntimeError("More than one sandbox exists; refusing to risk multiple DataDisk writers.")
-    for image in images:
-        assert_labels(image.labels, config, "disk image")
-        if image.labels.get("name") != config.disk_name:
-            raise RuntimeError("Unrecognized Hermes disk image name.")
-    for volume in volumes:
-        assert_labels(volume.labels, config, "DataDisk")
-        if volume.name != config.volume_name or volume.type != "DataDisk" or volume.size != "1Gi":
-            raise RuntimeError("The managed pilot requires exactly its own 1 GiB DataDisk.")
-    if len(volumes) > 1:
-        raise RuntimeError("Unexpected additional volumes; no resource will be removed.")
+def owned_inventory(
+    config: Config, clients: AzureClients, *, status_capture: StatusSink = None,
+) -> tuple[list[Any], list[Any], list[Any]]:
+    trace = StatusRecorder.coerce(status_capture)
+    assert_group_owned(config, clients, **trace.options("inventory.ownership"))
+    sandboxes = owned_sandboxes(config, clients, **trace.options("inventory"))
+    images = _status_list(trace, "inventory.images.list", clients.group.list_disk_images)
+    volumes = _status_list(trace, "inventory.volumes.list", clients.group.list_volumes)
+    with trace.step("inventory.sandboxes.count", error_category="inventory_count", details={"count": len(sandboxes)}):
+        if len(sandboxes) > 1:
+            raise RuntimeError("More than one sandbox exists; refusing to risk multiple DataDisk writers.")
+    for index, image in enumerate(images):
+        labels = getattr(image, "labels", None)
+        base = getattr(getattr(image, "image", None), "base", None)
+        with trace.step("inventory.images.check", error_category="label_mismatch", details={
+            "item_index": index, **_status_labels(labels, config), **_status_name(labels, config.disk_name),
+            "base_type": _egress_value_type(base), "base_digest_matches": base == config.image,
+        }) as step:
+            assert_labels(image.labels, config, "disk image")
+            step.error_category = "name_mismatch"
+            if image.labels.get("name") != config.disk_name:
+                raise RuntimeError("Unrecognized Hermes disk image name.")
+    for index, volume in enumerate(volumes):
+        kind, size = getattr(volume, "type", None), getattr(volume, "size", None)
+        details = {
+            "item_index": index, **_status_labels(getattr(volume, "labels", None), config),
+            "name_present": hasattr(volume, "name"),
+            "name_type": _egress_value_type(getattr(volume, "name", None)) if hasattr(volume, "name") else "absent",
+            "name_matches": getattr(volume, "name", None) == config.volume_name,
+            "volume_type_present": hasattr(volume, "type"),
+            "volume_type": _egress_value_type(kind) if hasattr(volume, "type") else "absent",
+            "volume_type_matches": kind == "DataDisk",
+            "size_present": hasattr(volume, "size"),
+            "size_type": _egress_value_type(size) if hasattr(volume, "size") else "absent",
+            "size_matches": size == "1Gi",
+        }
+        if kind == "DataDisk":
+            details["volume_type_tag"] = "DataDisk"
+        if size == "1Gi":
+            details["size_tag"] = "1Gi"
+        with trace.step("inventory.volumes.check", error_category="label_mismatch", details=details) as step:
+            assert_labels(volume.labels, config, "DataDisk")
+            step.error_category = "name_mismatch"
+            if volume.name != config.volume_name:
+                raise RuntimeError("The managed pilot requires exactly its own 1 GiB DataDisk.")
+            step.error_category = "volume_type_mismatch"
+            if volume.type != "DataDisk":
+                raise RuntimeError("The managed pilot requires exactly its own 1 GiB DataDisk.")
+            step.error_category = "volume_size_mismatch"
+            if volume.size != "1Gi":
+                raise RuntimeError("The managed pilot requires exactly its own 1 GiB DataDisk.")
+    with trace.step("inventory.volumes.count", error_category="inventory_count", details={"count": len(volumes)}):
+        if len(volumes) > 1:
+            raise RuntimeError("Unexpected additional volumes; no resource will be removed.")
     return sandboxes, images, volumes
