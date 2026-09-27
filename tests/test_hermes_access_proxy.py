@@ -196,6 +196,24 @@ class RoutePolicyTests(unittest.TestCase):
                     {"jsonrpc": "2.0", "id": "r1", "method": method, "params": params}, surface="tui",
                 ))
 
+    def test_native_tui_session_accepts_only_the_fixed_dashboard_workspace(self):
+        frame = {"jsonrpc": "2.0", "id": "r1", "method": "session.create", "params": {"cols": 120}}
+        for params in (frame["params"], {**frame["params"], "cwd": "/mnt/data"}):
+            with self.subTest(params=params):
+                self.assertTrue(proxy.rpc_allowed({**frame, "params": params}, surface="tui"))
+                self.assertFalse(proxy.rpc_allowed({**frame, "params": params}))
+        for cwd in (None, "", "/", "/root", "/mnt/data/", "/mnt/data/..", "/mnt/data/secrets",
+                    "/mnt/data\x00", "file:///mnt/data", True, 1, [], {}):
+            with self.subTest(cwd=cwd):
+                self.assertFalse(proxy.rpc_allowed(
+                    {**frame, "params": {**frame["params"], "cwd": cwd}}, surface="tui",
+                ))
+        for key, value in (("model", "external"), ("tools", ["terminal"]), ("profile", "other")):
+            with self.subTest(key=key):
+                self.assertFalse(proxy.rpc_allowed(
+                    {**frame, "params": {**frame["params"], "cwd": "/mnt/data", key: value}}, surface="tui",
+                ))
+
     def test_native_prompt_is_bounded_text_without_attachment_or_model_overrides(self):
         frame = {
             "jsonrpc": "2.0", "id": "r20", "method": "prompt.submit",

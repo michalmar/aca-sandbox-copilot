@@ -692,8 +692,9 @@ def rpc_allowed(frame: dict, *, surface: str = "sidebar") -> bool:
             return set(params) == {"key"} and params["key"] in ("full", "mtime")
         if method == "session.create":
             return (
-                not set(params) - {"cols", "profile"}
+                not set(params) - {"cols", "profile", "cwd"}
                 and type(params.get("cols")) is int and 1 <= params["cols"] <= 1000
+                and ("cwd" not in params or params["cwd"] == "/mnt/data")
             )
         if method in _TUI_ID_PARAMS:
             key = _TUI_ID_PARAMS[method]

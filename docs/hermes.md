@@ -227,7 +227,7 @@ MVP choice reinterprets those unknown fields or establishes hardened support.
 | Resources | Dedicated Hermes resource names and Sandbox Group system-assigned identity; 2 CPU, 4 GiB RAM, 20 GiB root, one single-writer 1 GiB DataDisk. Keep at least 256 MiB data headroom. |
 | Lifecycle | Raw `autoSuspendPolicy.enabled=false` creation/readback. No idle suspension or disk-resume workaround for this pilot. |
 | Configuration | `.env.hermes` only; exact nonsecret schema 1 at `/mnt/data/hermes/runtime.json`. No Copilot `.env` fallback. |
-| Foundry | A supplied existing inference endpoint, deployment, API mode, context length, and `https://ai.azure.com/.default` scope. Group managed identity, in-memory tokens; no static API key or automatic model/RBAC provisioning. |
+| Foundry | A supplied existing inference API base, deployment, API mode, context length, and `https://ai.azure.com/.default` scope. For chat completions, include the full `/openai/v1` base. Group managed identity, in-memory tokens; no static API key or automatic model/RBAC provisioning. |
 | Browser ingress | Exactly one HTTP 8080 `OnDemand` port, anonymous disabled, exact owner object-ID ACL. Tenant-wide membership is not equivalent to owner authorization. |
 | Dashboard | Real native dashboard on `127.0.0.1:9119`; no public 9119, 8642, or 3000. Browser uses the local owner relay, not the raw ingress URL. |
 | Tools | Only `clarify` and `memory`, plus exactly three Google read-only tools when eligible. No generic filesystem, shell, browser, install, scheduling, or configuration tools. |
@@ -238,6 +238,8 @@ MVP choice reinterprets those unknown fields or establishes hardened support.
 The runtime is a deliberately constrained assistant, not an arbitrary-code
 workspace. Native CLI/TUI dispatch and model-visible tool arrays are separately
 guarded; an HTTP route allowlist alone would not constrain PTY input.
+The dashboard's native `session.create` may supply `cwd` only as the exact
+`/mnt/data` workspace; arbitrary paths and alternate spellings remain forbidden.
 The native read-only `/context` command has an exact, argument-free TUI grammar;
 it is not a general slash-command or external sidebar RPC allowance.
 Clarify answers, bounded batch locks, interrupt, and close are admitted only
@@ -254,6 +256,13 @@ File, URL, git, and plugin `@context` references are refused before expansion or
 model invocation, including quiet CLI requests. Ordinary email text remains
 literal. The visible refusal is `Context references are disabled in managed
 Sandbox mode.`; it does not imply the requested content was read.
+
+For this pilot's `gpt-6-sol` deployment, the managed Azure Foundry provider sends
+explicit `reasoning_effort: "none"` for chat completions. The generic upstream
+provider omitted it, and supplying `low` was also rejected. This exact-model
+patch leaves other models' provider behavior unchanged. The main and auxiliary
+model bindings must all retain the complete API base; the endpoint hostname
+alone is not an OpenAI-compatible base URL.
 
 ### Fixed 1 GiB DataDisk response policy
 
@@ -531,6 +540,16 @@ writer. A retry observes the saved maintenance state and does not infer the
 pre-failure running intent.
 
 Once a separately approved deployment exists:
+
+The command below is the default owner-Entra access path. The separately
+approved preserved run11 pilot instead uses anonymous HTTPS ingress with the
+mandatory 256-bit transport key, and requires its private, run-bound key-only
+launcher. It acquires no ingress bearer and does not fall back from Entra
+authentication automatically. The public endpoint is reachable by anyone;
+missing or incorrect keys must receive the inner proxy's fixed 401 rejection.
+The live pilot has root-filesystem hotfixes for native workspace admission and
+the Foundry provider; its original immutable image was not rebuilt, so replacing
+that sandbox from the original image would not preserve those hotfixes.
 
 ```console
 python scripts/access_hermes.py

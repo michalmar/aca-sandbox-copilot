@@ -16,6 +16,7 @@ FINGERPRINTS = {
     "run_agent.py": "244da863d3c21591a3b5326dc14c2962d4e31131dda52df628502cd9fcbfea33",
     "agent/chat_completion_helpers.py": "72400c39a7999d617fed99329ec9ea1ed891dc46e5e3349079f1a026f29122a0",
     "agent/auxiliary_client.py": "e83807074f3577ac3980f43bfd578ffcc95efb591e38a9427d0e7d33ec7d8e4a",
+    "plugins/model-providers/azure-foundry/__init__.py": "7463d513a89aebcaaead8888038493e5dbbe4e630b49d5b8970b4eef4fddbdb9",
     "agent/models_dev.py": "b59ee0eae86e08eb57260fba231959ad40de1fc9c71f72f4895216c113138062",
     "agent/model_metadata.py": "b93bcdb69c2c182178fcc82eb618df72fe40fce28a900e1e276760858d8c5643",
     "agent/context_references.py": "c905f30e6adbc47063b039af44c22b637cca76ed79b08c49a82a3bfecee6e413",
@@ -95,6 +96,17 @@ class Patcher:
 
 def patch(root: Path, support: Path) -> None:
     p = Patcher(root)
+    p.replace("plugins/model-providers/azure-foundry/__init__.py",
+              "azure_foundry = ProviderProfile(",
+              """class ManagedFoundryProfile(ProviderProfile):
+    def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+        # This deployment requires explicit none for tool-enabled chat completions.
+        if context.get("model") == "gpt-6-sol":
+            return {}, {"reasoning_effort": "none"}
+        return super().build_api_kwargs_extras(reasoning_config=reasoning_config, **context)
+
+
+azure_foundry = ManagedFoundryProfile(""")
     p.function("model_tools.py", "get_tool_definitions", """
         from managed_policy import select_tools
         enabled_toolsets = select_tools(enabled_toolsets)
