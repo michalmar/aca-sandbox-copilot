@@ -547,9 +547,14 @@ mandatory 256-bit transport key, and requires its private, run-bound key-only
 launcher. It acquires no ingress bearer and does not fall back from Entra
 authentication automatically. The public endpoint is reachable by anyone;
 missing or incorrect keys must receive the inner proxy's fixed 401 rejection.
-The live pilot has root-filesystem hotfixes for native workspace admission and
-the Foundry provider; its original immutable image was not rebuilt, so replacing
-that sandbox from the original image would not preserve those hotfixes.
+The preserved pilot was migrated to the rebuilt immutable image from commit
+`5b4db704ab650108755bc9ecb8fa58beebeeeecc`, using digest
+`sha256:6896712dc2a76b88e0a5e31bac239301b36b31493f5197c1b05cbf749edba221`.
+Native workspace admission and the Foundry reasoning setting are now verified
+from image files, not root-filesystem hotfixes. Only compute was replaced; the
+DataDisk, group managed identity, and exact role assignments were preserved.
+Use the updated private `access_immutable_run11.py` launcher for that replacement;
+the earlier launcher is deliberately bound to the retired sandbox.
 
 ```console
 python scripts/access_hermes.py
