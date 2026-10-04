@@ -417,6 +417,7 @@ class ProxyHopTests(unittest.IsolatedAsyncioTestCase):
         self.key_reads = 0
         self.ingress_requests = 0
         self.expired_forever = False
+        self.anonymous_ingress = False
         self.redirect_ws = False
         self.redirect_hits = 0
         self.event_socket = None
@@ -489,7 +490,10 @@ class ProxyHopTests(unittest.IsolatedAsyncioTestCase):
 
         async def ingress(request):
             self.ingress_requests += 1
-            if request.headers.get("Authorization") != "Bearer " + FAKE_BEARER:
+            if self.anonymous_ingress:
+                if "Authorization" in request.headers:
+                    return web.Response(status=400, text="anonymous fixture never expects a bearer")
+            elif request.headers.get("Authorization") != "Bearer " + FAKE_BEARER:
                 return web.Response(status=401, text="fake Entra ingress rejected")
             if self.expired_forever:
                 return web.Response(status=401, headers={proxy.EXPIRED_HEADER: "1"})
@@ -541,7 +545,7 @@ class ProxyHopTests(unittest.IsolatedAsyncioTestCase):
 
         app = web.Application()
         app.router.add_route("*", "/{path:.*}", ingress)
-        ingress_url = await self.server(app)
+        ingress_url = self.ingress_url = await self.server(app)
 
         async def token_provider():
             return self.bearer
@@ -718,6 +722,52 @@ class ProxyHopTests(unittest.IsolatedAsyncioTestCase):
             await socket.send_str("after rotation")
             self.assertEqual(await socket.receive_str(timeout=3), "after rotation")
         self.assertEqual(self.key_reads, 2)
+
+    async def test_key_only_relay_reaches_anonymous_ingress_without_any_bearer(self):
+        from access_hermes import KeyOnlyRelayProxy
+
+        self.anonymous_ingress = True
+        reads = []
+
+        async def key_provider():
+            reads.append(self.current_key)
+            return self.current_key
+
+        relay_client = await self.client(auto_decompress=False, trace_configs=[proxy.no_redirect_trace()])
+        relay = KeyOnlyRelayProxy(
+            local_origin="http://127.0.0.1:18766", target=TARGET, key_provider=key_provider,
+            client=MappedClient(relay_client, TARGET, self.ingress_url),
+        )
+        relay_url = await self.server(relay.app)
+        relay.local_origin = relay_url
+        browser = await self.client(cookie_jar=aiohttp.CookieJar(unsafe=True))
+        headers = {"Origin": relay_url, "X-Hermes-Session-Token": FAKE_SESSION}
+        async with browser.get(relay_url + "/") as response:
+            self.assertEqual(response.status, 200)
+            page = await response.text()
+        self.assertIn(FAKE_SESSION, page)
+        self.assertNotIn(self.current_key, page)
+        async with browser.get(relay_url + "/api/status", headers=headers) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {"ok": True})
+        forwarded = self.observed[-1][2]
+        self.assertEqual(forwarded["X-Hermes-Session-Token"], FAKE_SESSION)
+        self.assertEqual(forwarded["Origin"], relay_url)
+        for name in ("Authorization", proxy.KEY_HEADER, proxy.RELAY_ORIGIN_HEADER, proxy.RELAY_AUTHORITY_HEADER, "Cookie"):
+            self.assertNotIn(name, forwarded)
+        self.current_key = "d" * 64
+        self.inner.key = self.current_key
+        async with browser.ws_connect(relay_url + "/api/pty?token=" + FAKE_SESSION, headers=headers) as socket:
+            await socket.send_str("anonymous ingress")
+            self.assertEqual(await socket.receive_str(timeout=3), "anonymous ingress")
+        self.assertEqual(reads, ["a" * 64, "d" * 64])
+        stranger = await self.client()
+        for presented in ({}, {proxy.KEY_HEADER: "e" * 64}):
+            previous = len(self.observed)
+            async with stranger.get(self.ingress_url + "/api/status", headers=presented) as response:
+                self.assertEqual(response.status, 401)
+                self.assertEqual(response.headers[proxy.EXPIRED_HEADER], "1")
+            self.assertEqual(len(self.observed), previous)
 
     async def test_websocket_rpc_denials_preserve_request_ids_and_never_forward(self):
         async with self.browser.ws_connect(self.local_url + "/api/ws?token=" + FAKE_SESSION, headers=self.headers) as socket:

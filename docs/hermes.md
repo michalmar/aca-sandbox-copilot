@@ -9,10 +9,12 @@ or change this repository's Copilot deployment, image, scheduler, or `.env`.
 
 **WARNING: `allow-all-mvp` removes outbound network isolation. All internet
 destinations are permitted, with no TLS inspection. A compromised prompt/model
-path could exfiltrate personal data to any destination.** Owner-only Entra
-ingress, exact model-visible tools, managed HTTP/native RPC restrictions,
-WhatsApp self-chat guards, and Google read-only scopes remain mandatory, but
-they are not an outbound network boundary.
+path could exfiltrate personal data to any destination.** Browser ingress
+authentication (owner-only Entra by default, or the explicit `anonymous-key`
+transport-key mode described under access), exact model-visible tools,
+managed HTTP/native RPC restrictions, WhatsApp self-chat guards, and Google
+read-only scopes remain mandatory, but they are not an outbound network
+boundary.
 
 The user selected **No inspection + Allow all egress** for the temporary MVP.
 To accept that risk deliberately, set this in the separate `.env.hermes` or
@@ -228,7 +230,7 @@ MVP choice reinterprets those unknown fields or establishes hardened support.
 | Lifecycle | Raw `autoSuspendPolicy.enabled=false` creation/readback. No idle suspension or disk-resume workaround for this pilot. |
 | Configuration | `.env.hermes` only; exact nonsecret schema 1 at `/mnt/data/hermes/runtime.json`. No Copilot `.env` fallback. |
 | Foundry | A supplied existing inference API base, deployment, API mode, context length, and `https://ai.azure.com/.default` scope. For chat completions, include the full `/openai/v1` base. Group managed identity, in-memory tokens; no static API key or automatic model/RBAC provisioning. |
-| Browser ingress | Exactly one HTTP 8080 `OnDemand` port, anonymous disabled, exact owner object-ID ACL. Tenant-wide membership is not equivalent to owner authorization. |
+| Browser ingress | Exactly one HTTP 8080 `OnDemand` port. Default `HERMES_INGRESS_MODE=entra`: anonymous disabled, exact owner object-ID ACL; tenant-wide membership is not equivalent to owner authorization. Explicit `anonymous-key`: no platform authentication or identity filter; only the inner proxy's rotating transport key protects the dashboard. |
 | Dashboard | Real native dashboard on `127.0.0.1:9119`; no public 9119, 8642, or 3000. Browser uses the local owner relay, not the raw ingress URL. |
 | Tools | Only `clarify` and `memory`, plus exactly three Google read-only tools when eligible. No generic filesystem, shell, browser, install, scheduling, or configuration tools. |
 | WhatsApp | Owner self-chat only, text only, locally authenticated bridge. Pairing is explicit and interactive; device keys are sensitive persistent data. |
@@ -544,31 +546,78 @@ retry followed by explicit resume; it does not suggest recovery of the deleted
 writer. A retry observes the saved maintenance state and does not infer the
 pre-failure running intent.
 
-Once a separately approved deployment exists:
+Once a separately approved deployment exists, choose the browser ingress mode
+in `.env.hermes`:
 
-The command below is the default owner-Entra access path. On 2026-10-04 the
-preserved run11 pilot was replaced with `scripts/deploy_hermes.py --replace`,
-using the image from commit `32fe6fb982239bc0d5930881217cb1aaa61a3b72` with
-digest
+| `HERMES_INGRESS_MODE` | Raw port 8080 `auth` | Relay credentials sent to the ingress URL |
+| --- | --- | --- |
+| `entra` (default; blank) | `anonymous=false`, exact owner object-ID ACL | Owner ingress bearer and private transport key |
+| `anonymous-key` | `anonymous=true`, no identity filter | Private transport key only; no `Authorization` header |
+
+**WARNING: `anonymous-key` publishes Sandbox port 8080 without platform
+authentication.** Anyone who learns the URL reaches the inner proxy, which
+returns 401 before forwarding unless the request carries the current 256-bit
+transport key. Only owner Sandbox data-plane access can read that key. Use this
+mode for occasional owner setup through the local relay, not as a primary or
+shared access path. Deploy, deployment checks, port reconciliation, and the
+relay print this warning whenever it is selected. Unknown values fail closed;
+the anonymous mode is never implied.
+
+Apply a mode change to the running pilot without replacing compute:
+
+```console
+python scripts/deploy_hermes.py --reconcile-port --confirm-target "<full-hermes-group-resource-id>"
+```
+
+Port reconciliation skips group provisioning and fails unless the owned
+sandbox already exists. It repeats the owner, ownership, no-suspend, egress,
+runtime, image, and dashboard checks. Only then does it replace port 8080 for
+the configured mode and verify the exact raw readback. The current port is not
+pre-validated, because changing it is the purpose. It cannot be combined with
+`--fresh` or `--replace` and does not touch the image, runtime, DataDisk, role
+assignments, or managed identity. To close anonymous ingress, set
+`HERMES_INGRESS_MODE=entra` and run the same command.
+
+On 2026-10-04 the preserved run11 pilot was replaced with
+`scripts/deploy_hermes.py --replace`, using the image from commit
+`32fe6fb982239bc0d5930881217cb1aaa61a3b72` with digest
 `sha256:e55689f2620acd9d8e0c457ef2c698bc17789c53a1445c534e8b4f70a20680f5`.
 Only compute and its disk image were replaced; the DataDisk, group managed
 identity, and exact role assignments were preserved. Native workspace
 admission and the Foundry reasoning setting are verified from image files, not
-root-filesystem hotfixes. The pilot now uses this owner-Entra port. Its
-earlier anonymous key-only ingress and private run-bound launchers are retired
-with the deleted sandboxes. After that replacement, the platform Entra ingress
-still returned HTTP 401 for an owner token requested for the documented
-ingress scope, so dashboard access remains unresolved. QR pairing then
+root-filesystem hotfixes. That replacement used the owner-Entra port; the
+earlier run-bound anonymous launchers were retired with the deleted sandboxes.
+The platform Entra ingress then returned HTTP 401 for an owner CLI token
+requested for the documented ingress scope, and a browser opening the raw URL
+is redirected to the platform Entra sign-in instead of the relay boundary, so
+`entra` mode has no working owner relay. QR pairing then
 succeeded, but self-chat replies failed: gateway startup had downloaded tirith
 into the profile `bin`, and a status read during a Baileys credential rewrite
 moved the gateway to maintenance. Both causes are addressed in this document.
+
+Later on 2026-10-04, `--reconcile-port` switched that same sandbox to
+`anonymous-key` without replacing compute, and the readback matched. The raw
+ingress URL returned the inner 401 with `X-Hermes-Access-Key-Expired: 1` for
+`/` and `/api/status`, both without a key and with a wrong one; there was no
+platform redirect. Through the key-only relay, `/` returned the dashboard with
+its injected session token and no transport key, `/api/status` returned 200,
+and the chat WebSocket `/api/ws` completed its handshake and delivered a
+gateway event. A browser rendered the dashboard with the gateway running.
+Running the same command with `HERMES_INGRESS_MODE=entra` then closed the
+port, and the owner object-ID readback matched. The raw URL returned a platform
+401 without the inner marker, even for a request carrying the valid transport
+key, and `scripts/test_hermes.py` reported `entra` ingress with platform
+authentication.
 
 ```console
 python scripts/access_hermes.py
 ```
 
 Open the printed `http://127.0.0.1:8765/` URL on that same computer and keep the
-process running. Use `--port` for a different unprivileged loopback port. Do not
+process running. Type the URL into the address bar or use a bookmark. A link
+followed from another site is refused with `Cross-site localhost requests are
+not permitted.`; reload the page or enter the URL directly. Use `--port` for a
+different unprivileged loopback port. Do not
 forward or share this localhost listener; local OS users/processes are within
 the owner workstation's trust boundary, much like an SSH tunnel.
 
@@ -578,9 +627,12 @@ The path is:
 browser -> 127.0.0.1 owner relay -> HTTPS Sandbox 8080 -> inner proxy -> 127.0.0.1:9119
 ```
 
-The tenant-pinned local `AzureCliCredential` obtains the ingress bearer for
-`https://auth.adcproxy.io/.default`. The browser never receives it or the private
-transport key. A new 32-byte random transport key is created only on verified
+In `entra` mode the tenant-pinned local `AzureCliCredential` obtains the
+ingress bearer for `https://auth.adcproxy.io/.default`. In `anonymous-key` mode
+the relay strips `Authorization` and sends no bearer; the same credential is
+used only for the owner check and SDK reads. The browser never receives a
+bearer or the private transport key. A new 32-byte random transport key is
+created only on verified
 `/dev/shm` tmpfs, in a 0700 directory/0600 file, and read into relay RAM through
 the SDK. There is no persistent key fallback.
 

@@ -14,13 +14,32 @@ from aiohttp import web
 from azure.core.exceptions import AzureError
 
 from hermes_common import (
-    AzureClients, INGRESS_SCOPE, ROOT, assert_no_suspend, assert_owner,
+    ANONYMOUS_INGRESS_MODE, AzureClients, INGRESS_SCOPE, ROOT, assert_no_suspend, assert_owner,
     deployment_egress, get_sandbox, load_egress_config, raw_sandbox, read_access_key,
-    validate_egress, validate_ports, warn_unrestricted_egress,
+    validate_egress, validate_ports, warn_ingress_mode, warn_unrestricted_egress,
 )
 
 sys.path.insert(0, str(ROOT / "hermes/image"))
 from access_proxy import Proxy
+
+
+class KeyOnlyRelayProxy(Proxy):
+    """Loopback relay for anonymous-key ingress; the private transport key is its only credential."""
+
+    def __init__(self, *, local_origin: str, target: str, key_provider, client=None):
+        super().__init__(
+            local_origin=local_origin, target=target, token_provider=self._no_ingress_token,
+            key_provider=key_provider, client=client,
+        )
+
+    @staticmethod
+    async def _no_ingress_token() -> str:
+        return ""
+
+    async def headers(self, request, *, refresh: bool = False):
+        headers = await super().headers(request, refresh=refresh)
+        headers.pop("Authorization", None)
+        return headers
 
 
 class AzureRelayCredentials:
@@ -58,6 +77,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(name)s %(message)s")
     config = load_egress_config(args.env_file)
     warn_unrestricted_egress(config.egress_mode)
+    warn_ingress_mode(config)
     with AzureClients.create(config) as clients:
         assert_owner(clients.credential, config)
         sandbox = get_sandbox(config, clients)
@@ -69,10 +89,13 @@ def main() -> None:
         target = validate_ports(raw, config, sandbox.sandbox_id)
         credentials = AzureRelayCredentials(clients, sandbox)
         origin = f"http://127.0.0.1:{args.port}"
-        proxy = Proxy(
-            local_origin=origin, target=target,
-            token_provider=credentials.bearer, key_provider=credentials.access_key,
-        )
+        if config.ingress_mode == ANONYMOUS_INGRESS_MODE:
+            proxy = KeyOnlyRelayProxy(local_origin=origin, target=target, key_provider=credentials.access_key)
+        else:
+            proxy = Proxy(
+                local_origin=origin, target=target,
+                token_provider=credentials.bearer, key_provider=credentials.access_key,
+            )
         print(f"Open {origin}/ in this computer's browser. Keep this owner relay running.")
         web.run_app(proxy.app, host="127.0.0.1", port=args.port, access_log=None, print=None)
 

@@ -245,6 +245,47 @@ class ExplicitEgressModeTests(unittest.TestCase):
             self.assertIn(text, output)
 
 
+class IngressModeTests(unittest.TestCase):
+    def values(self, **extra):
+        return {
+            "HERMES_SUBSCRIPTION_ID": config().subscription_id,
+            "HERMES_TENANT_ID": config().tenant_id,
+            "HERMES_OWNER_OBJECT_ID": config().owner_object_id,
+            "HERMES_EGRESS_MODE": common.MVP_EGRESS_MODE,
+            **extra,
+        }
+
+    def test_platform_authenticated_entra_is_default_and_anonymous_key_is_explicit(self):
+        self.assertEqual(config().ingress_mode, common.ENTRA_INGRESS_MODE)
+        for extra, expected in (
+            ({}, common.ENTRA_INGRESS_MODE), ({"HERMES_INGRESS_MODE": ""}, common.ENTRA_INGRESS_MODE),
+            ({"HERMES_INGRESS_MODE": "entra"}, common.ENTRA_INGRESS_MODE),
+            ({"HERMES_INGRESS_MODE": "anonymous-key"}, common.ANONYMOUS_INGRESS_MODE),
+        ):
+            with self.subTest(extra=extra), patch.object(common, "_read_env", return_value=self.values(**extra)):
+                self.assertEqual(common.load_egress_config(Path("chosen.env.hermes")).ingress_mode, expected)
+
+    def test_unknown_ingress_modes_fail_closed_without_echoing_values(self):
+        for mode in ("anonymous", "Anonymous-Key", "none", "entra ", "anonymous-key-secret-canary"):
+            with (
+                self.subTest(mode=mode),
+                patch.object(common, "_read_env", return_value=self.values(HERMES_INGRESS_MODE=mode)),
+                self.assertRaisesRegex(ValueError, "HERMES_INGRESS_MODE") as raised,
+            ):
+                common.load_egress_config(Path("chosen.env.hermes"))
+            self.assertNotIn("secret-canary", str(raised.exception))
+
+    def test_anonymous_warning_is_explicit_and_entra_is_silent(self):
+        with self.assertLogs("hermes.ingress", level="WARNING") as captured:
+            common.warn_ingress_mode(config(ingress_mode="anonymous-key"))
+        output = "\n".join(captured.output)
+        for text in ("without platform authentication", "256-bit transport key", "scripts/access_hermes.py",
+                     "HERMES_INGRESS_MODE=entra", "--reconcile-port"):
+            self.assertIn(text, output)
+        with self.assertNoLogs("hermes.ingress", level="WARNING"):
+            common.warn_ingress_mode(config())
+
+
 class AzurePolicyTests(unittest.TestCase):
     def setUp(self):
         self.config = config()
@@ -309,6 +350,65 @@ class AzurePolicyTests(unittest.TestCase):
             port[key] = value
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 common.validate_ports({"ports": [port]}, self.config, self.identifier)
+
+    def test_malformed_entra_auth_readback_is_blocked_not_a_crash(self):
+        for auth in (None, [], "anonymous", {"anonymous": False, "entraId": None}):
+            port = {**self.port, "auth": copy.deepcopy(auth)}
+            with self.subTest(auth=auth), self.assertRaisesRegex(RuntimeError, "BLOCKED"):
+                common.validate_ports({"ports": [port]}, self.config, self.identifier)
+
+    def test_anonymous_key_port_is_exact_and_rejects_identity_or_auth_drift(self):
+        anonymous = config(ingress_mode="anonymous-key")
+        port = common.port_document(anonymous, self.identifier)
+        self.assertEqual(port, {**self.port, "auth": {"anonymous": True}})
+        self.assertEqual(
+            common.validate_ports({"ports": [port]}, anonymous, self.identifier),
+            common.ingress_url(self.identifier, anonymous.location),
+        )
+        for disabled in ({"entraId": {"enabled": False, "objectIds": []}}, {"emails": [], "tenantIds": None}):
+            readback = copy.deepcopy(port)
+            readback["auth"].update(disabled)
+            with self.subTest(disabled=disabled):
+                common.validate_ports({"ports": [readback]}, anonymous, self.identifier)
+        for auth in (
+            self.port["auth"], {"anonymous": False}, {"anonymous": "true"}, {}, None, [],
+            {"anonymous": True, "entraId": {"enabled": True, "objectIds": [anonymous.owner_object_id]}},
+            {"anonymous": True, "tenantIds": [anonymous.tenant_id]}, {"anonymous": True, "emails": ["owner@example.com"]},
+        ):
+            drifted = {**port, "auth": copy.deepcopy(auth)}
+            with self.subTest(auth=auth), self.assertRaisesRegex(RuntimeError, "BLOCKED"):
+                common.validate_ports({"ports": [drifted]}, anonymous, self.identifier)
+        for ports in ([], [port, port]):
+            with self.subTest(count=len(ports)), self.assertRaisesRegex(RuntimeError, "anonymous transport-key port"):
+                common.validate_ports({"ports": ports}, anonymous, self.identifier)
+        with self.assertRaises(ValueError):
+            common.port_document(anonymous, self.identifier, object_ids=(anonymous.owner_object_id,))
+        with self.assertRaisesRegex(RuntimeError, "BLOCKED"):
+            common.validate_ports({"ports": [port]}, self.config, self.identifier)
+
+    def test_port_mode_switch_uses_raw_put_and_requires_the_new_mode_readback(self):
+        anonymous = config(ingress_mode="anonymous-key")
+        anonymous_port = common.port_document(anonymous, self.identifier)
+        for current, target, expected in ((self.port, anonymous, anonymous_port), (anonymous_port, self.config, self.port)):
+            sandbox = MagicMock()
+            sandbox.sandbox_id = self.identifier
+            sandbox._sbx_path = "/explicit/sandbox"
+            sandbox._dp_get.side_effect = [
+                {"id": self.identifier, "ports": [current]}, {"id": self.identifier, "ports": [expected]},
+            ]
+            with self.subTest(mode=target.ingress_mode):
+                self.assertEqual(
+                    common.configure_port(sandbox, target), common.ingress_url(self.identifier, target.location),
+                )
+                sandbox._dp_put.assert_called_once_with("/explicit/sandbox/ports", {"ports": [expected]})
+        stale = MagicMock()
+        stale.sandbox_id = self.identifier
+        stale._sbx_path = "/explicit/sandbox"
+        stale._dp_get.side_effect = [
+            {"id": self.identifier, "ports": [self.port]}, {"id": self.identifier, "ports": [self.port]},
+        ]
+        with self.assertRaisesRegex(RuntimeError, "BLOCKED"):
+            common.configure_port(stale, anonymous)
 
     def test_none_allow_is_exact_and_reserved_hosts_do_not_create_rules(self):
         self.assertEqual(self.egress, {"defaultAction": "Allow", "trafficInspection": "None"})
@@ -1914,6 +2014,74 @@ class EgressStatusAndAccessTests(unittest.TestCase):
                 azure.assert_called_once_with(self.config)
                 self.assertNotIn("VALUE_CANARY", "\n".join(logged.output))
 
+    def test_status_reports_ingress_mode_and_rejects_a_port_from_the_other_mode(self):
+        anonymous = config(ingress_mode="anonymous-key")
+        anonymous_raw = {**self.raw, "ports": [common.port_document(anonymous, "sandbox-id")]}
+        for checked, raw, expected in (
+            (self.config, self.raw, {"mode": "entra", "platform_authentication": True}),
+            (anonymous, anonymous_raw, {"mode": "anonymous-key", "platform_authentication": False}),
+            (self.config, anonymous_raw, None), (anonymous, self.raw, None),
+        ):
+            with (
+                self.subTest(mode=checked.ingress_mode, live=raw["ports"][0]["auth"]),
+                patch.object(test_hermes, "assert_owner"),
+                patch.object(test_hermes, "owned_inventory", return_value=([], [], [object()])),
+                patch.object(test_hermes, "get_sandbox", return_value=self.sandbox),
+                patch.object(test_hermes, "raw_sandbox", return_value=raw),
+                patch.object(test_hermes, "read_runtime", return_value=common.runtime_document(checked)),
+                patch.object(test_hermes, "read_access_key") as key,
+                patch.object(test_hermes, "control_status", return_value=self.status),
+                self.assertLogs("hermes", level="WARNING") as logged,
+            ):
+                if expected is None:
+                    with self.assertRaisesRegex(RuntimeError, "BLOCKED"):
+                        test_hermes.inspect_deployment(checked, self.clients)
+                    key.assert_not_called()
+                else:
+                    self.assertEqual(test_hermes.inspect_deployment(checked, self.clients)["ingress"], expected)
+            self.assertEqual(
+                "without platform authentication" in "\n".join(logged.output),
+                checked.ingress_mode == "anonymous-key",
+            )
+
+    def test_anonymous_access_uses_the_key_only_relay_and_never_the_bearer_relay(self):
+        anonymous = config(ingress_mode="anonymous-key")
+        anonymous_raw = {**self.raw, "ports": [common.port_document(anonymous, "sandbox-id")]}
+        for selected, raw, allowed in ((anonymous, anonymous_raw, True), (self.config, anonymous_raw, False),
+                                       (anonymous, self.raw, False)):
+            with (
+                self.subTest(mode=selected.ingress_mode, live=raw["ports"][0]["auth"]),
+                patch.object(access_hermes, "load_egress_config", return_value=selected),
+                patch.object(common.AzureClients, "create"),
+                patch.object(access_hermes, "assert_owner"),
+                patch.object(access_hermes, "get_sandbox", return_value=self.sandbox),
+                patch.object(access_hermes, "raw_sandbox", return_value=raw),
+                patch.object(access_hermes, "Proxy") as bearer_relay,
+                patch.object(access_hermes, "KeyOnlyRelayProxy") as key_only,
+                patch.object(access_hermes.web, "run_app") as run,
+                patch.object(sys, "argv", ["script"]),
+                self.assertLogs("hermes", level="WARNING") as logged,
+                redirect_stdout(io.StringIO()),
+            ):
+                if allowed:
+                    access_hermes.main()
+                    bearer_relay.assert_not_called()
+                    self.assertEqual(set(key_only.call_args.kwargs), {"local_origin", "target", "key_provider"})
+                    self.assertEqual(key_only.call_args.kwargs["target"], common.ingress_url("sandbox-id", "swedencentral"))
+                    run.assert_called_once_with(
+                        key_only.return_value.app, host="127.0.0.1", port=8765, access_log=None, print=None,
+                    )
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "BLOCKED"):
+                        access_hermes.main()
+                    bearer_relay.assert_not_called()
+                    key_only.assert_not_called()
+                    run.assert_not_called()
+            self.assertEqual(
+                "without platform authentication" in "\n".join(logged.output),
+                selected.ingress_mode == "anonymous-key",
+            )
+
     def test_status_rejects_http_drift_before_runtime_key_or_dashboard_reads(self):
         self.raw["egressPolicy"]["http"] = {"defaultAction": "Allow", "trafficInspection": "Full"}
         with (
@@ -3084,6 +3252,80 @@ class OrderedDeploymentTests(unittest.TestCase):
         self.assertEqual(self.events, ["get:old-sandbox", "status:old-sandbox"])
         self.mocks["create_image"].assert_not_called()
         self.old.begin_delete.assert_not_called()
+
+    def serve_live_port(self, live_config):
+        original_get = self.old._dp_get.side_effect
+
+        def live_port(path):
+            raw = original_get(path)
+            raw["ports"] = [common.port_document(live_config, "old-sandbox")]
+            return raw
+
+        self.old._dp_get.side_effect = live_port
+
+    def test_ordinary_deploy_never_adopts_or_rewrites_a_port_from_the_other_mode(self):
+        self.images["old-image"].image.base = self.config.image
+        self.serve_live_port(config(ingress_mode="anonymous-key"))
+        with self.assertRaisesRegex(RuntimeError, "BLOCKED"):
+            deploy_hermes.deploy(self.config, self.clients)
+        self.assertEqual(self.events, ["get:old-sandbox"])
+        self.mocks["configure_port"].assert_not_called()
+        self.old._dp_post.assert_not_called()
+
+    def test_port_reconciliation_rechecks_existing_sandbox_then_only_reapplies_port(self):
+        for target, live in ((config(ingress_mode="anonymous-key"), config()), (config(), config(ingress_mode="anonymous-key"))):
+            self.events.clear()
+            self.mocks["configure_port"].reset_mock()
+            self.old._dp_post.reset_mock()
+            self.config = target
+            self.images["old-image"].image.base = target.image
+            self.serve_live_port(live)
+            with self.subTest(target=target.ingress_mode), self.assertLogs("hermes", level="WARNING") as logged:
+                self.assertEqual(deploy_hermes.deploy(target, self.clients, reconcile_port=True), "old-sandbox")
+            self.assertEqual(self.events, ["get:old-sandbox", "status:old-sandbox", "open-port"])
+            self.mocks["configure_port"].assert_called_once_with(self.old, target)
+            self.old._dp_post.assert_called_once_with(
+                "/test/old-sandbox/executeShellCommand", {"command": shlex.join([*common.CONTROL, "status", "--json"])},
+            )
+            self.assertEqual(
+                "without platform authentication" in "\n".join(logged.output), target.ingress_mode == "anonymous-key",
+            )
+        self.mocks["provision_group"].assert_not_called()
+        self.mocks["create_image"].assert_not_called()
+        self.clients.group._dp_put.assert_not_called()
+        self.clients.group.create_volume.assert_not_called()
+        self.old.begin_delete.assert_not_called()
+        self.assertIn("Hermes gateway state: running", self.output.getvalue())
+
+    def test_port_reconciliation_keeps_runtime_image_and_dashboard_gates(self):
+        self.config = config(ingress_mode="anonymous-key")
+        self.serve_live_port(config())
+        for mismatch in ("Runtime differs", "Image differs", "existing Hermes dashboard is not ready"):
+            self.events.clear()
+            self.mocks["read_runtime"].side_effect = lambda *args: common.runtime_document(
+                config(foundry_deployment="other") if mismatch == "Runtime differs" else self.config,
+            )
+            self.images["old-image"].image.base = (
+                "example.invalid/hermes@sha256:" + "b" * 64 if mismatch == "Image differs" else self.config.image
+            )
+            self.dashboard_state["old-sandbox"] = "stopped" if mismatch.startswith("existing") else "running"
+            with self.subTest(mismatch=mismatch), self.assertRaisesRegex(RuntimeError, mismatch):
+                deploy_hermes.deploy(self.config, self.clients, reconcile_port=True)
+            self.mocks["configure_port"].assert_not_called()
+            self.assertNotIn("open-port", self.events)
+        self.mocks["provision_group"].assert_not_called()
+        self.mocks["create_image"].assert_not_called()
+        self.old.begin_delete.assert_not_called()
+
+    def test_port_reconciliation_without_the_existing_sandbox_changes_nothing(self):
+        self.active.clear()
+        with self.assertRaisesRegex(RuntimeError, "existing owned Hermes sandbox; nothing was changed"):
+            deploy_hermes.deploy(self.config, self.clients, reconcile_port=True)
+        self.assertEqual(self.events, [])
+        for name in ("provision_group", "configure_port", "create_image", "upload_private_file"):
+            self.mocks[name].assert_not_called()
+        self.clients.group._dp_put.assert_not_called()
+        self.clients.group.create_volume.assert_not_called()
 
     def test_image_cleanup_refuses_live_references_changed_owner_and_source(self):
         with self.assertRaisesRegex(RuntimeError, "still references"):

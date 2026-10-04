@@ -10,10 +10,10 @@ from pathlib import Path
 from azure.core.exceptions import HttpResponseError
 
 from hermes_common import (
-    AzureClients, Config, MVP_EGRESS_MODE, MVP_EGRESS_WARNING, StatusRecorder, StatusSink,
+    ANONYMOUS_INGRESS_MODE, AzureClients, Config, MVP_EGRESS_MODE, MVP_EGRESS_WARNING, StatusRecorder, StatusSink,
     assert_no_suspend, assert_owner, control_status, deployment_egress,
     get_sandbox, load_egress_config, owned_inventory, raw_sandbox, read_access_key, read_runtime, runtime_document,
-    validate_egress, validate_ports, verify_mvp_network, warn_unrestricted_egress,
+    validate_egress, validate_ports, verify_mvp_network, warn_ingress_mode, warn_unrestricted_egress,
 )
 
 
@@ -26,6 +26,7 @@ def inspect_deployment(
     }):
         egress = deployment_egress(config)
         warn_unrestricted_egress(config.egress_mode)
+    warn_ingress_mode(config)
     assert_owner(clients.credential, config, **trace.options())
     _, _, volumes = owned_inventory(config, clients, **trace.options())
     with trace.step("status.volume-count", error_category="inventory_count", details={"count": len(volumes)}):
@@ -55,6 +56,10 @@ def inspect_deployment(
         "egress": {
             "mode": config.egress_mode, **egress,
             "outbound_isolation": False, "warning": MVP_EGRESS_WARNING, "readback": readback,
+        },
+        "ingress": {
+            "mode": config.ingress_mode,
+            "platform_authentication": config.ingress_mode != ANONYMOUS_INGRESS_MODE,
         },
         "foundry_inference": "NOT VERIFIED", "whatsapp_delivery": "NOT VERIFIED",
         "google_live_read": "NOT VERIFIED", "token_expiry_soak": "NOT VERIFIED",

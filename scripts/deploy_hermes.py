@@ -23,7 +23,7 @@ from hermes_common import (
     delete_sandbox_confirmed, deployment_egress, endpoint_for_region, exec_checked, load_egress_config, owned_inventory,
     quiesce_gateway, raw_sandbox, read_control_status, read_runtime,
     runtime_document, sandbox_document, upload_private_file, validate_egress,
-    validate_ports, verify_mvp_network, wait_running, warn_unrestricted_egress,
+    validate_ports, verify_mvp_network, wait_running, warn_ingress_mode, warn_unrestricted_egress,
 )
 
 LOG = logging.getLogger("hermes.deploy")
@@ -394,19 +394,24 @@ def report_gateway_state(status: dict) -> None:
 
 def deploy(
     config: Config, clients: AzureClients, *, replace: bool = False, fresh: bool = False,
+    reconcile_port: bool = False,
     egress_capture: Callable[[dict[str, Any]], None] | None = None,
     status_capture: StatusSink = None,
 ) -> str:
     if fresh and replace:
         raise ValueError("Fresh empty-group readiness cannot be combined with replacement.")
+    if reconcile_port and (fresh or replace):
+        raise ValueError("Port reconciliation cannot be combined with fresh deployment or replacement.")
     trace = StatusRecorder.coerce(status_capture)
     egress = deployment_egress(config)
     warn_unrestricted_egress(config.egress_mode)
+    warn_ingress_mode(config)
     document = runtime_document(config)
     if not config.image:
         raise ValueError("Supply an existing public immutable HERMES_IMAGE before deployment.")
     assert_owner(clients.credential, config)
-    provision_group(config, clients, fresh=fresh, **trace.options())
+    if not reconcile_port:
+        provision_group(config, clients, fresh=fresh, **trace.options())
     sandboxes, images, volumes = owned_inventory(config, clients, **trace.options())
     if fresh:
         with trace.step("provision.fresh-inventory", error_category="inventory_count", details={
@@ -414,12 +419,15 @@ def deploy(
         }):
             if sandboxes or images or volumes:
                 raise RuntimeError("Fresh inventory changed after readiness; existing data was not adopted or changed.")
+    if reconcile_port and not sandboxes:
+        raise RuntimeError("Port reconciliation needs the existing owned Hermes sandbox; nothing was changed.")
     if sandboxes and not replace:
         sandbox = clients.group.get_sandbox_client(sandboxes[0].id)
         raw = raw_sandbox(sandbox)
         assert_no_suspend(raw)
         validate_egress(raw, egress, capture=egress_capture)
-        validate_ports(raw, config, sandbox.sandbox_id)
+        if not reconcile_port:
+            validate_ports(raw, config, sandbox.sandbox_id)
         if read_runtime(sandbox) != document:
             raise RuntimeError("Runtime differs. Use explicit --replace or controlled reconfigure; nothing was changed.")
         source_id = raw.get("sourcesRef", {}).get("diskImage", {}).get("id")
@@ -429,6 +437,8 @@ def deploy(
         status = control_status(sandbox)
         if status["dashboard"] != "running":
             raise RuntimeError("The existing Hermes dashboard is not ready; no resources were changed.")
+        if reconcile_port:
+            configure_port(sandbox, config)
         report_gateway_state(status)
         return sandbox.sandbox_id
     if not volumes:
@@ -538,13 +548,21 @@ def main() -> None:
     lifecycle = parser.add_mutually_exclusive_group()
     lifecycle.add_argument("--replace", action="store_true", help="Replace the owned sandbox, preserving its single-writer DataDisk.")
     lifecycle.add_argument("--fresh", action="store_true", help="Require sustained readiness of an owned empty group before first deployment.")
+    lifecycle.add_argument(
+        "--reconcile-port", action="store_true",
+        help="Re-verify the existing owned sandbox, then only re-apply port 8080 for HERMES_INGRESS_MODE.",
+    )
     parser.add_argument("--confirm-target", help="Exact full Sandbox Group resource ID authorizing this operation.")
     args = parser.parse_args()
     config = load_egress_config(args.env_file)
     confirm_target(config, args.confirm_target)
     with AzureClients.create(config) as clients:
-        identifier = deploy(config, clients, replace=args.replace, fresh=args.fresh)
+        identifier = deploy(
+            config, clients, replace=args.replace, fresh=args.fresh, reconcile_port=args.reconcile_port,
+        )
     print(f"Hermes sandbox ready: {identifier}")
+    if args.reconcile_port:
+        print(f"Port 8080 readback matches HERMES_INGRESS_MODE={config.ingress_mode}.")
     print("Use scripts/access_hermes.py. Personal pairing, Google consent and Foundry inference remain separate gates.")
 
 

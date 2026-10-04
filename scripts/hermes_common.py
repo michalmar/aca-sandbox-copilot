@@ -42,6 +42,15 @@ PYTHON = "/opt/hermes/.venv/bin/python"
 CONTROL = [PYTHON, "/opt/hermes-sandbox/control.py"]
 INGRESS_SCOPE = "https://auth.adcproxy.io/.default"
 INGRESS_AUDIENCES = {"https://auth.adcproxy.io/", "9f34678b-7f96-4c6d-ac69-b06b1255b61e"}
+ENTRA_INGRESS_MODE = "entra"
+ANONYMOUS_INGRESS_MODE = "anonymous-key"
+INGRESS_MODES = (ENTRA_INGRESS_MODE, ANONYMOUS_INGRESS_MODE)
+ANONYMOUS_INGRESS_WARNING = (
+    "WARNING: HERMES_INGRESS_MODE=anonymous-key publishes Sandbox port 8080 without platform authentication. "
+    "Anyone who learns its URL reaches the inner proxy; only the rotating 256-bit transport key, readable "
+    "solely through owner Sandbox data-plane access, protects the dashboard. Use it for occasional owner setup "
+    "through scripts/access_hermes.py, and set HERMES_INGRESS_MODE=entra with --reconcile-port to close it."
+)
 LABELS = {"managed-by": "aca-sandbox-hermes"}
 MIN_FREE_BYTES = 256 * 1024 * 1024
 # Exact spellings of 1 GiB (1073741824 bytes), not a general quantity parser.
@@ -68,7 +77,7 @@ MVP_EGRESS_WARNING = (
     "WARNING: TEMPORARY allow-all-mvp mode has NO outbound network isolation. "
     "All internet destinations are permitted by the requested mode, with no TLS inspection. "
     "A compromised prompt/model path could exfiltrate personal data to any destination. "
-    "Entra owner-only ingress and managed tool restrictions remain required, but are not an egress boundary. "
+    "Owner-only ingress controls and managed tool restrictions remain required, but are not an egress boundary. "
     "Policy readback and a smoke check are not proof of unrestricted connectivity."
 )
 _EGRESS_FIELD_NAME = re.compile(r"[A-Za-z_@][A-Za-z0-9_.-]{0,127}\Z")
@@ -92,7 +101,7 @@ _ENV_KEYS = {
     "HERMES_FOUNDRY_ENDPOINT", "HERMES_FOUNDRY_DEPLOYMENT", "HERMES_FOUNDRY_API_MODE",
     "HERMES_FOUNDRY_CONTEXT_LENGTH", "HERMES_FOUNDRY_SCOPE", "HERMES_WHATSAPP_PHONE",
     "HERMES_GOOGLE_ENABLED", "HERMES_GOOGLE_EXPECTED_EMAIL", "HERMES_GOOGLE_CALENDAR_IDS",
-    "HERMES_IDENTITY_HOST", "HERMES_WHATSAPP_HOSTS", "HERMES_EGRESS_MODE",
+    "HERMES_IDENTITY_HOST", "HERMES_WHATSAPP_HOSTS", "HERMES_EGRESS_MODE", "HERMES_INGRESS_MODE",
 }
 
 
@@ -254,6 +263,11 @@ def warn_unrestricted_egress(mode: str) -> None:
     logging.getLogger("hermes.egress").warning(MVP_EGRESS_WARNING)
 
 
+def warn_ingress_mode(config: Config) -> None:
+    if config.ingress_mode == ANONYMOUS_INGRESS_MODE:
+        logging.getLogger("hermes.ingress").warning(ANONYMOUS_INGRESS_WARNING)
+
+
 def load_egress_config(env_path: Path | None = None) -> Config:
     values = _read_env(Path(env_path) if env_path is not None else ENV_PATH)
     require_egress_mode(values.get("HERMES_EGRESS_MODE", ""))
@@ -284,8 +298,11 @@ class Config:
     identity_host: str = ""
     whatsapp_hosts: tuple[str, ...] = ()
     egress_mode: str = ""
+    ingress_mode: str = ENTRA_INGRESS_MODE
 
     def __post_init__(self) -> None:
+        if self.ingress_mode not in INGRESS_MODES:
+            raise ValueError("HERMES_INGRESS_MODE must be entra or anonymous-key.")
         _uuid(self.subscription_id, "HERMES_SUBSCRIPTION_ID")
         _uuid(self.tenant_id, "HERMES_TENANT_ID")
         _uuid(self.owner_object_id, "HERMES_OWNER_OBJECT_ID")
@@ -338,6 +355,8 @@ class Config:
         kwargs["whatsapp_hosts"] = tuple(
             item.strip() for item in values.get("HERMES_WHATSAPP_HOSTS", "").split(",") if item.strip()
         )
+        # Blank keeps the safer platform-authenticated default; anonymous-key is never implied.
+        kwargs["ingress_mode"] = values.get("HERMES_INGRESS_MODE", "") or ENTRA_INGRESS_MODE
         return cls(**kwargs)
 
     @property
@@ -815,35 +834,58 @@ def validate_ingress_url(value: str, *, sandbox_id: str, location: str) -> str:
 
 
 def port_document(config: Config, sandbox_id: str, *, object_ids: tuple[str, ...] | None = None) -> dict[str, Any]:
-    owners = object_ids if object_ids is not None else (config.owner_object_id,)
-    if not owners or len(set(owners)) != len(owners):
-        raise ValueError("Port ACL must contain distinct explicit object IDs.")
-    for owner in owners:
-        _uuid(owner, "Port object ID")
+    if config.ingress_mode == ANONYMOUS_INGRESS_MODE:
+        if object_ids is not None:
+            raise ValueError("Anonymous key-only ingress cannot contain identity filters.")
+        auth: dict[str, Any] = {"anonymous": True}
+    else:
+        owners = object_ids if object_ids is not None else (config.owner_object_id,)
+        if not owners or len(set(owners)) != len(owners):
+            raise ValueError("Port ACL must contain distinct explicit object IDs.")
+        for owner in owners:
+            _uuid(owner, "Port object ID")
+        auth = {"anonymous": False, "entraId": {"enabled": True, "objectIds": list(owners)}}
     return {
         "port": 8080, "url": ingress_url(sandbox_id, config.location),
-        "auth": {"anonymous": False, "entraId": {"enabled": True, "objectIds": list(owners)}},
-        "activationMode": "OnDemand", "protocol": "Http",
+        "auth": auth, "activationMode": "OnDemand", "protocol": "Http",
     }
 
 
+def _auth_setting_present(value: Any) -> bool:
+    # A disabled or empty nested readback block is not an identity filter.
+    if isinstance(value, dict):
+        return any(_auth_setting_present(item) for item in value.values())
+    return bool(value)
+
+
 def validate_ports(raw: dict[str, Any], config: Config, sandbox_id: str, *, object_ids: tuple[str, ...] | None = None) -> str:
+    anonymous = config.ingress_mode == ANONYMOUS_INGRESS_MODE
     ports = raw.get("ports")
     if not isinstance(ports, list) or len(ports) != 1 or not isinstance(ports[0], dict):
-        raise RuntimeError("Expected exactly one Entra-only port.")
+        raise RuntimeError(
+            "Expected exactly one anonymous transport-key port." if anonymous else "Expected exactly one Entra-only port."
+        )
     port = ports[0]
     expected = port_document(config, sandbox_id, object_ids=object_ids)
     if any(port.get(key) != expected[key] for key in ("port", "activationMode", "protocol")):
         raise RuntimeError("Unexpected port, protocol or activation mode.")
-    auth = port.get("auth", {})
-    entra = auth.get("entraId", {})
-    if (
-        auth.get("anonymous") is not False or entra.get("enabled") is not True
-        or sorted(entra.get("objectIds") or []) != sorted(expected["auth"]["entraId"]["objectIds"])
-        or any(value for key, value in entra.items() if key not in {"enabled", "objectIds"})
-        or any(value for key, value in auth.items() if key not in {"anonymous", "entraId"})
-    ):
-        raise RuntimeError("BLOCKED: raw ingress ACL is not the exact object-ID-only policy.")
+    auth = port.get("auth")
+    if anonymous:
+        if (
+            not isinstance(auth, dict) or auth.get("anonymous") is not True
+            or any(_auth_setting_present(value) for key, value in auth.items() if key != "anonymous")
+        ):
+            raise RuntimeError("BLOCKED: raw ingress readback is not the exact anonymous key-only policy.")
+    else:
+        entra = auth.get("entraId") if isinstance(auth, dict) else None
+        if (
+            not isinstance(entra, dict)
+            or auth.get("anonymous") is not False or entra.get("enabled") is not True
+            or sorted(entra.get("objectIds") or []) != sorted(expected["auth"]["entraId"]["objectIds"])
+            or any(value for key, value in entra.items() if key not in {"enabled", "objectIds"})
+            or any(value for key, value in auth.items() if key not in {"anonymous", "entraId"})
+        ):
+            raise RuntimeError("BLOCKED: raw ingress ACL is not the exact object-ID-only policy.")
     return validate_ingress_url(port.get("url", ""), sandbox_id=sandbox_id, location=config.location)
 
 

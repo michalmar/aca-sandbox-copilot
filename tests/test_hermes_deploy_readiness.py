@@ -663,30 +663,40 @@ class FreshReadinessTests(unittest.TestCase):
         self.assert_no_mutations()
 
     def test_fresh_replacement_combination_rejected_before_any_clients(self):
-        clients = MagicMock()
-        with self.assertRaisesRegex(ValueError, "cannot be combined"):
-            deploy.deploy(self.config, clients, fresh=True, replace=True)
-        self.assertEqual(clients.mock_calls, [])
+        for modes in ({"fresh": True, "replace": True}, {"reconcile_port": True, "fresh": True},
+                      {"reconcile_port": True, "replace": True}):
+            clients = MagicMock()
+            with self.subTest(modes=modes), self.assertRaisesRegex(ValueError, "cannot be combined"):
+                deploy.deploy(self.config, clients, **modes)
+            self.assertEqual(clients.mock_calls, [])
 
     def test_cli_modes_are_explicit_and_exclusive(self):
-        with (
-            patch.object(sys, "argv", ["deploy", "--fresh", "--replace"]),
-            patch.object(common.AzureClients, "create") as azure,
-            patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit),
+        for flags in (["--fresh", "--replace"], ["--reconcile-port", "--fresh"], ["--reconcile-port", "--replace"]):
+            with (
+                self.subTest(flags=flags),
+                patch.object(sys, "argv", ["deploy", *flags]),
+                patch.object(common.AzureClients, "create") as azure,
+                patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit),
+            ):
+                deploy.main()
+            azure.assert_not_called()
+        for flag, modes in (
+            ("--fresh", {"replace": False, "fresh": True, "reconcile_port": False}),
+            ("--reconcile-port", {"replace": False, "fresh": False, "reconcile_port": True}),
         ):
-            deploy.main()
-        azure.assert_not_called()
-        with (
-            patch.object(sys, "argv", ["deploy", "--fresh", "--confirm-target", self.config.group_scope]),
-            patch.object(deploy, "load_egress_config", return_value=self.config),
-            patch.object(common.AzureClients, "create") as azure,
-            patch.object(deploy, "deploy", return_value="synthetic") as operation,
-            patch.object(sys, "stdout", io.StringIO()),
-        ):
-            deploy.main()
-        operation.assert_called_once_with(
-            self.config, azure.return_value.__enter__.return_value, replace=False, fresh=True,
-        )
+            with (
+                self.subTest(flag=flag),
+                patch.object(sys, "argv", ["deploy", flag, "--confirm-target", self.config.group_scope]),
+                patch.object(deploy, "load_egress_config", return_value=self.config),
+                patch.object(common.AzureClients, "create") as azure,
+                patch.object(deploy, "deploy", return_value="synthetic") as operation,
+                patch.object(sys, "stdout", io.StringIO()) as output,
+            ):
+                deploy.main()
+            operation.assert_called_once_with(self.config, azure.return_value.__enter__.return_value, **modes)
+            self.assertEqual(
+                "Port 8080 readback matches HERMES_INGRESS_MODE=entra." in output.getvalue(), modes["reconcile_port"],
+            )
 
     def test_persistence_failure_at_boundaries_stops_and_restores_transport(self):
         for operation, phase in (
