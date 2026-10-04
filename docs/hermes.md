@@ -622,9 +622,15 @@ Within that shell, the pinned control program is:
 
 Do not run these as an indiscriminate sequence. `stop-gateway` enters deliberate
 maintenance; `start-gateway` is the explicit resumption. Pairing is an
-interactive owner action, not a dashboard endpoint. Reconfigure stops children,
-applies the image/runtime-owned profile, validates it, and restores appropriate
-process state while preserving deliberate gateway maintenance.
+interactive owner action, not a dashboard endpoint. Pairing activates when the
+staged credentials contain a `me.id` that matches the configured owner; Baileys
+QR pairing never sets `creds.registered`, so it is not required. The bridge pins
+WhatsApp Web protocol `[2, 3000, 1043857760]`: with the Baileys-bundled
+`[2, 3000, 1035194821]`, connections closed with status 405 before any QR,
+whereas the pinned version completed live QR pairing on 2026-10-03. The
+Baileys package itself stays locked. Reconfigure stops children, applies the
+image/runtime-owned profile, validates it, and restores appropriate process
+state while preserving deliberate gateway maintenance.
 
 Status has exactly `schema_version`, `dashboard`, `gateway`, `whatsapp`,
 `google`, and `disk_free_bytes`. Missing/failed integrations must not look

@@ -522,7 +522,8 @@ def normalize_jid(value: Any, domain: str) -> str:
 
 
 def verified_identity(creds: Any, owner_phone: str) -> frozenset[str]:
-    if not isinstance(creds, dict) or creds.get("registered") is not True or not isinstance(creds.get("me"), dict):
+    # Baileys QR pairing never sets creds.registered (only pairing codes do); the owner-bound me.id is the proof.
+    if not isinstance(creds, dict) or not isinstance(creds.get("me"), dict):
         raise PolicyError("WhatsApp credentials are not paired")
     jid = normalize_jid(creds["me"].get("id"), "s.whatsapp.net")
     if jid != f"{owner_phone.lstrip('+')}@s.whatsapp.net":

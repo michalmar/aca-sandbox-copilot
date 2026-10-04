@@ -62,7 +62,6 @@ export function makeWASocket(options) {
       await emit('connection.update', { qr: 'OFFLINE_FAKE_QR_NOT_AN_ACCOUNT' });
       return;
     }
-    options.auth.creds.registered = true;
     options.auth.creds.me = user;
     await emit('creds.update', {});
     await emit('connection.update', { connection: 'open' });

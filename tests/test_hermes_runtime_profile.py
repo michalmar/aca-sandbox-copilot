@@ -42,7 +42,8 @@ def sample_runtime():
 
 
 def fake_creds(phone="+420777123456"):
-    return {"registered": True, "me": {"id": phone[1:] + ":42@s.whatsapp.net", "lid": "987654321:7@lid"}}
+    # Baileys 7.0.0-rc13 QR pairing sets `me` but leaves `registered` false (only pairing codes set it).
+    return {"registered": False, "me": {"id": phone[1:] + ":42@s.whatsapp.net", "lid": "987654321:7@lid"}}
 
 
 class RuntimeContractTests(unittest.TestCase):

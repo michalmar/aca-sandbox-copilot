@@ -426,7 +426,7 @@ managed.status('starting');
 const MAX_MESSAGE_LENGTH = 4096 - REPLY_PREFIX.length;
 """.strip())
     p.replace(bridge, "const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);",
-              "const getWAVersion = async () => undefined; // Use the locked Baileys bundled protocol version.")
+              "const getWAVersion = async () => [2, 3000, 1043857760]; // Validated Web protocol; package stays locked.")
     p.replace(bridge, "  return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;",
               "  if (typeof message !== 'string') throw new Error('Only text messages are permitted');\n"
               "  // The managed socket prefixes each chunk, not the unchunked input.\n"
