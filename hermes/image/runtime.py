@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import time
 from typing import Any, Iterator
 from urllib.parse import urlsplit
 import uuid
@@ -26,6 +27,8 @@ INSTALL = Path("/opt/hermes")
 SUPPORT = Path("/opt/hermes-sandbox")
 PYTHON = INSTALL / ".venv/bin/python"
 MIN_FREE_BYTES = 256 * 1024 * 1024
+CREDS_READ_ATTEMPTS = 3
+CREDS_RETRY_SECONDS = 0.1
 REPLY_PREFIX = "[Hermes] "
 SCHEMA_KEYS = {
     "schema_version", "foundry", "owner", "google",
@@ -353,6 +356,8 @@ def managed_config(runtime: dict, *, google_configured: bool) -> dict:
         "security": {
             "allow_lazy_installs": False, "allow_private_urls": False,
             "redact_secrets": True, "protected_instruction_files": True,
+            # Upstream otherwise downloads tirith into HOME/bin, which check_single_profile forbids.
+            "tirith_enabled": False,
         },
         "memory": {
             "provider": "", "memory_enabled": True, "user_profile_enabled": True,
@@ -534,11 +539,22 @@ def verified_identity(creds: Any, owner_phone: str) -> frozenset[str]:
     return frozenset(identities)
 
 
+def _read_creds(session: Path) -> Any:
+    # Baileys rewrites creds.json in place (truncate, then write), so a concurrent read can be torn.
+    for attempt in range(1, CREDS_READ_ATTEMPTS + 1):
+        try:
+            return read_json(session / "creds.json", limit=1024 * 1024)
+        except PolicyError:
+            if attempt == CREDS_READ_ATTEMPTS:
+                raise
+            time.sleep(CREDS_RETRY_SECONDS)
+
+
 def whatsapp_status(runtime: dict, session: Path = SESSION) -> str:
     if not (session / "creds.json").exists():
         return "not-paired"
     try:
-        verified_identity(read_json(session / "creds.json", limit=1024 * 1024), runtime["owner"]["whatsapp_phone"])
+        verified_identity(_read_creds(session), runtime["owner"]["whatsapp_phone"])
     except PolicyError:
         return "re-pair-required"
     marker = session.parent / "connection-state.json"

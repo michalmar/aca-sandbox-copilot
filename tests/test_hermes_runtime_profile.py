@@ -135,6 +135,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertFalse(config["gateway"]["multiplex_profiles"])
         self.assertEqual(config["approvals"]["mode"], "manual")
         self.assertFalse(config["security"]["allow_lazy_installs"])
+        self.assertFalse(config["security"]["tirith_enabled"])
         self.assertEqual(config["tools"]["tool_search"]["enabled"], "off")
         self.assertFalse(config["web"]["keyless_fallback"])
         for auxiliary in config["auxiliary"].values():
@@ -332,6 +333,32 @@ class RuntimeContractTests(unittest.TestCase):
         runtime.atomic_json(self.home / "connection-state.json", [])
         with self.assertLogs("runtime", level="ERROR"):
             self.assertEqual(runtime.whatsapp_status(self.value, session), "re-pair-required")
+
+    def test_torn_creds_rewrite_is_retried_not_treated_as_lost_pairing(self):
+        # Baileys rewrites creds.json in place; a reader can observe the truncated intermediate state.
+        session = self.home / "session"
+        session.mkdir()
+        creds = session / "creds.json"
+        complete = json.dumps(fake_creds())
+        creds.write_text(complete[:10])
+        creds.chmod(0o600)
+        with patch.object(runtime.time, "sleep", side_effect=lambda _: creds.write_text(complete)) as sleep:
+            self.assertEqual(runtime.whatsapp_status(self.value, session), "paired")
+        sleep.assert_called_once_with(runtime.CREDS_RETRY_SECONDS)
+
+    def test_persistently_invalid_creds_still_require_repair(self):
+        session = self.home / "session"
+        session.mkdir()
+        creds = session / "creds.json"
+        creds.write_text(json.dumps(fake_creds())[:10])
+        creds.chmod(0o600)
+        with patch.object(runtime.time, "sleep") as sleep:
+            self.assertEqual(runtime.whatsapp_status(self.value, session), "re-pair-required")
+        self.assertEqual(sleep.call_count, runtime.CREDS_READ_ATTEMPTS - 1)
+        runtime.atomic_json(creds, fake_creds("+420777123457"))
+        with patch.object(runtime.time, "sleep") as sleep:
+            self.assertEqual(runtime.whatsapp_status(self.value, session), "re-pair-required")
+        sleep.assert_not_called()
 
     def test_disabled_google_profile_does_not_need_google_imports(self):
         with patch.object(runtime, "google_status", side_effect=AssertionError("Google diagnostic spawned")):

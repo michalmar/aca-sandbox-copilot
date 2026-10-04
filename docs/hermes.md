@@ -257,6 +257,11 @@ model invocation, including quiet CLI requests. Ordinary email text remains
 literal. The visible refusal is `Context references are disabled in managed
 Sandbox mode.`; it does not imply the requested content was read.
 
+The upstream tirith command scanner is disabled with
+`security.tirith_enabled: false`. No shell tool is exposed for it to assess,
+and its gateway-startup download would place an unmanaged executable in the
+profile's `bin` directory, which the single-profile check rejects.
+
 For this pilot's `gpt-6-sol` deployment, the managed Azure Foundry provider sends
 explicit `reasoning_effort: "none"` for chat completions. The generic upstream
 provider omitted it, and supplying `low` was also rejected. This exact-model
@@ -541,20 +546,22 @@ pre-failure running intent.
 
 Once a separately approved deployment exists:
 
-The command below is the default owner-Entra access path. The separately
-approved preserved run11 pilot instead uses anonymous HTTPS ingress with the
-mandatory 256-bit transport key, and requires its private, run-bound key-only
-launcher. It acquires no ingress bearer and does not fall back from Entra
-authentication automatically. The public endpoint is reachable by anyone;
-missing or incorrect keys must receive the inner proxy's fixed 401 rejection.
-The preserved pilot was migrated to the rebuilt immutable image from commit
-`5b4db704ab650108755bc9ecb8fa58beebeeeecc`, using digest
-`sha256:6896712dc2a76b88e0a5e31bac239301b36b31493f5197c1b05cbf749edba221`.
-Native workspace admission and the Foundry reasoning setting are now verified
-from image files, not root-filesystem hotfixes. Only compute was replaced; the
-DataDisk, group managed identity, and exact role assignments were preserved.
-Use the updated private `access_immutable_run11.py` launcher for that replacement;
-the earlier launcher is deliberately bound to the retired sandbox.
+The command below is the default owner-Entra access path. On 2026-10-04 the
+preserved run11 pilot was replaced with `scripts/deploy_hermes.py --replace`,
+using the image from commit `32fe6fb982239bc0d5930881217cb1aaa61a3b72` with
+digest
+`sha256:e55689f2620acd9d8e0c457ef2c698bc17789c53a1445c534e8b4f70a20680f5`.
+Only compute and its disk image were replaced; the DataDisk, group managed
+identity, and exact role assignments were preserved. Native workspace
+admission and the Foundry reasoning setting are verified from image files, not
+root-filesystem hotfixes. The pilot now uses this owner-Entra port. Its
+earlier anonymous key-only ingress and private run-bound launchers are retired
+with the deleted sandboxes. After that replacement, the platform Entra ingress
+still returned HTTP 401 for an owner token requested for the documented
+ingress scope, so dashboard access remains unresolved. QR pairing then
+succeeded, but self-chat replies failed: gateway startup had downloaded tirith
+into the profile `bin`, and a status read during a Baileys credential rewrite
+moved the gateway to maintenance. Both causes are addressed in this document.
 
 ```console
 python scripts/access_hermes.py
@@ -624,7 +631,13 @@ Do not run these as an indiscriminate sequence. `stop-gateway` enters deliberate
 maintenance; `start-gateway` is the explicit resumption. Pairing is an
 interactive owner action, not a dashboard endpoint. Pairing activates when the
 staged credentials contain a `me.id` that matches the configured owner; Baileys
-QR pairing never sets `creds.registered`, so it is not required. The bridge pins
+QR pairing never sets `creds.registered`, so it is not required. Baileys
+rewrites `creds.json` in place (truncate, then write), so a concurrent status
+read can see a partial file. That read is retried up to three times, 100 ms
+apart, before `re-pair-required` is reported; credentials that parse but name
+another account fail at once. Running supervision treats `re-pair-required` as
+persistent maintenance, so a misread would stop the gateway until an explicit
+`start-gateway`. The bridge pins
 WhatsApp Web protocol `[2, 3000, 1043857760]`: with the Baileys-bundled
 `[2, 3000, 1035194821]`, connections closed with status 405 before any QR,
 whereas the pinned version completed live QR pairing on 2026-10-03. The
@@ -791,6 +804,14 @@ stop the gateway and use controlled reconfiguration rather than manually changin
 generated tools, MCP, models, environment, or profile files. Keep the DataDisk
 and use the explicit recovery below if the old image/control path cannot be
 repaired. Another writer is never created before the old deletion is confirmed.
+
+Each validated request rejects a non-empty `/mnt/data/hermes/bin`, `profiles`,
+or `plugins` directory, so a stray file there makes every reply fail with
+`PolicyError` (`unmanaged profile extensions are forbidden in managed mode`).
+Gateways from earlier images downloaded `bin/tirith` at startup. With the
+gateway stopped, remove only that unmanaged file, confirm the directory is
+empty, and then deploy or reconfigure; profile application refuses to run while
+it remains.
 
 ## Cleanup
 

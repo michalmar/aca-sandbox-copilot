@@ -320,6 +320,14 @@ class RuntimeImageTests(unittest.TestCase):
         self.assertEqual(response["result"]["config"]["providers"], {})
         self.assertEqual(response["result"]["config"]["mcp_servers"], {})
 
+    def test_managed_profile_disables_upstream_tirith_download(self):
+        # Gateway startup otherwise downloads tirith into HOME/bin and every message then fails policy.
+        from tools import tirith_security
+        with patch.object(tirith_security.threading, "Thread", side_effect=AssertionError("tirith download started")):
+            self.assertIsNone(tirith_security.ensure_installed(log_failures=False))
+        self.assertFalse(tirith_security._load_security_config()["tirith_enabled"])
+        self.runtime_module.check_single_profile()
+
     def test_native_executable_handlers_independently_deny_even_with_permissive_proxy(self):
         import access_proxy
         from tui_gateway import server
