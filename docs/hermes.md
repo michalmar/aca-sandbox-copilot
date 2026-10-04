@@ -609,6 +609,16 @@ port, and the owner object-ID readback matched. The raw URL returned a platform
 key, and `scripts/test_hermes.py` reported `entra` ingress with platform
 authentication.
 
+Later on 2026-10-04, a `--replace` to enable Google failed during handoff with
+`gateway: owned process did not exit`. It was the first handoff that had to stop
+a running gateway. The new image and sandbox were rolled back, and the old
+sandbox kept running with its DataDisk untouched. Its supervisor then recorded
+`failed` while every child kept running. The guest `btime` had moved by one
+second since the children started, which broke the wall-clock process identity
+described under
+[Controlled runtime operations](#controlled-runtime-operations). Images built
+after this incident use the kernel start time instead.
+
 ```console
 python scripts/access_hermes.py
 ```
@@ -696,6 +706,14 @@ whereas the pinned version completed live QR pairing on 2026-10-03. The
 Baileys package itself stays locked. Reconfigure stops children, applies the
 image/runtime-owned profile, validates it, and restores appropriate process
 state while preserving deliberate gateway maintenance.
+
+The supervisor identifies each owned process by its PID plus the kernel start
+time from `/proc/<pid>/stat`, counted in clock ticks since boot. It does not use
+psutil's wall-clock `create_time()`. That value adds the current whole-second
+`btime` from `/proc/stat`, which moves when the guest wall clock drifts or steps
+across a second boundary. After such a move no owned process would match, so
+nothing could be signalled. `stop-gateway`, reconfigure, and replacement
+handoffs would then fail with `owned process did not exit`.
 
 Status has exactly `schema_version`, `dashboard`, `gateway`, `whatsapp`,
 `google`, and `disk_free_bytes`. Missing/failed integrations must not look
@@ -856,6 +874,25 @@ stop the gateway and use controlled reconfiguration rather than manually changin
 generated tools, MCP, models, environment, or profile files. Keep the DataDisk
 and use the explicit recovery below if the old image/control path cannot be
 repaired. Another writer is never created before the old deletion is confirmed.
+
+An image that predates start-time process identity can fail `stop-gateway`,
+reconfigure, or a replacement handoff with `owned process did not exit`. The
+saved state is then `failed` and the children are still running, but its
+supervisor can no longer signal them. To recover while keeping the DataDisk:
+
+1. In the owner shell, send `SIGTERM` to the gateway PID recorded in
+   `/mnt/data/hermes/gateway.pid`.
+2. Wait for it and its WhatsApp bridge, which shares its session ID, to exit.
+   Send `SIGTERM` to a bridge that remains.
+3. Confirm that port 3000 is free.
+4. Send `SIGTERM` to the proxy and the dashboard, and confirm that they exit.
+5. Run `control.py reconfigure`, then immediately `control.py stop-gateway`.
+6. Confirm that `status --json` reports `maintenance`.
+7. Replace with `--replace` into an image built after the fix, then resume with
+   `control.py start-gateway`.
+
+Do not replace into an unfixed image. It keeps the same latent failure for the
+next handoff.
 
 Each validated request rejects a non-empty `/mnt/data/hermes/bin`, `profiles`,
 or `plugins` directory, so a stray file there makes every reply fail with

@@ -168,9 +168,9 @@ class SupervisorTests(unittest.TestCase):
 
     def test_process_reuse_is_never_signalled(self):
         process = Mock(pid=100, poll=Mock(return_value=1))
-        child = lifecycle.Child("test", process, identities={100: 10.0, 101: 11.0})
+        child = lifecycle.Child("test", process, identities={100: 10, 101: 11})
         child.capture = Mock()
-        with patch.object(lifecycle, "process_identity", side_effect=lambda pid: 99.0 if pid == 100 else 11.0), \
+        with patch.object(lifecycle, "process_identity", side_effect=lambda pid: 99 if pid == 100 else 11), \
                 patch.object(lifecycle.os, "kill") as kill:
             child.signal(15)
         kill.assert_called_once_with(101, 15)
@@ -237,6 +237,61 @@ class SupervisorTests(unittest.TestCase):
             self.s.tick()
         self.assertFalse(self.s.failures["gateway"])
         self.assertEqual(self.s.status()["gateway"], "running")
+
+
+class ProcessIdentityTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.procfs = Path(directory.name)
+        patcher = patch.object(lifecycle, "PROCFS", self.procfs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_stat(self, pid, start, state="S", comm="hermes gateway"):
+        fields = [state, "1", str(pid), str(pid), "0", "-1", "4194560", "9", "0", "0", "0", "1", "2", "0", "0",
+                  "20", "0", "1", "0", str(start), "1234", "56"]
+        (self.procfs / str(pid)).mkdir(exist_ok=True)
+        (self.procfs / str(pid) / "stat").write_text(f"{pid} ({comm}) {' '.join(fields)}\n")
+
+    def test_identity_is_kernel_start_ticks_even_with_hostile_command_name(self):
+        self.write_stat(104, 3851, comm="a) Z 1 2 (b")
+        self.assertEqual(lifecycle.process_identity(104), 3851)
+
+    def test_zombie_vanished_and_missing_processes_have_no_identity(self):
+        self.write_stat(104, 3851, state="Z")
+        self.assertIsNone(lifecycle.process_identity(104))
+        self.assertIsNone(lifecycle.process_identity(105))
+        self.write_stat(106, 3851)
+        with patch.object(lifecycle.Path, "read_bytes", side_effect=ProcessLookupError(3, "gone")):
+            self.assertIsNone(lifecycle.process_identity(106))
+
+    def test_unreadable_or_malformed_identity_fails_closed(self):
+        (self.procfs / "104").mkdir()
+        for content in (b"104 (gateway S 1 2", b"104 (gateway) S 1 2 3", b"104 (g) " + b"S " * 19 + b"later"):
+            (self.procfs / "104" / "stat").write_bytes(content)
+            with self.assertRaisesRegex(runtime.PolicyError, "identity cannot be read"):
+                lifecycle.process_identity(104)
+        with patch.object(lifecycle.Path, "read_bytes", side_effect=PermissionError(13, "denied")), \
+                self.assertRaisesRegex(runtime.PolicyError, "identity cannot be read"):
+            lifecycle.process_identity(104)
+
+    def test_owned_identity_never_consults_wall_clock_boot_time(self):
+        self.write_stat(104, 3851)
+        child = lifecycle.Child("gateway", Mock(pid=104, poll=Mock(return_value=None)))
+        child.identities[104] = lifecycle.process_identity(104)
+        child.capture = Mock()
+        wall_clock = types.SimpleNamespace(boot_time=Mock(side_effect=AssertionError("wall-clock identity used")))
+        with patch.dict(sys.modules, {"psutil": wall_clock}), patch.object(lifecycle.os, "kill") as kill:
+            self.assertEqual(child.live(), [104])
+            child.signal(15)
+        kill.assert_called_once_with(104, 15)
+
+    def test_reused_pid_with_new_start_ticks_is_not_owned(self):
+        self.write_stat(104, 3851)
+        child = lifecycle.Child("gateway", Mock(pid=104), identities={104: 3851})
+        self.write_stat(104, 9000)
+        self.assertEqual(child.live(), [])
 
 
 class ControlSocketTests(unittest.TestCase):

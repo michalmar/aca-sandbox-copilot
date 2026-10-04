@@ -12,6 +12,7 @@ import time
 
 from runtime import HOME, PolicyError
 
+PROCFS = Path("/proc")
 RUNTIME_DIRECTORY = Path("/dev/shm/hermes")
 CONTROL_SOCKET = RUNTIME_DIRECTORY / "control.sock"
 OPERATION_LOCK = HOME / "control.lock"
@@ -51,15 +52,20 @@ def verify_tmpfs(mountinfo: Path = Path("/proc/self/mountinfo")) -> None:
         raise PolicyError("/dev/shm must be tmpfs; persistent control/key fallback is forbidden")
 
 
-def process_identity(pid: int) -> float | None:
-    import psutil
+def process_identity(pid: int) -> int | None:
+    # Kernel start time in clock ticks since boot. psutil's wall-clock create_time() re-adds the
+    # current /proc/stat btime, so a guest clock adjustment would make every owned process unrecognized.
     try:
-        process = psutil.Process(pid)
-        return None if process.status() == psutil.STATUS_ZOMBIE else process.create_time()
-    except psutil.NoSuchProcess:
+        stat = (PROCFS / str(pid) / "stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
         return None
-    except psutil.AccessDenied as exc:
+    except OSError as exc:
         raise PolicyError("owned process identity cannot be read") from exc
+    _, closing, tail = stat.rpartition(b")")
+    fields = tail.split()
+    if not closing or len(fields) < 20 or not fields[19].isdigit():
+        raise PolicyError("owned process identity cannot be read")
+    return None if fields[0] in (b"Z", b"X") else int(fields[19])
 
 
 @dataclass
@@ -67,7 +73,7 @@ class Child:
     name: str
     process: subprocess.Popen
     started: float = field(default_factory=time.monotonic)
-    identities: dict[int, float] = field(default_factory=dict)
+    identities: dict[int, int] = field(default_factory=dict)
 
     def capture(self) -> None:
         import psutil
@@ -76,7 +82,8 @@ class Child:
             root = psutil.Process(self.process.pid)
             if not parent_running:
                 return  # A reaped child's PID cannot legitimately name a current session leader.
-            if self.process.pid in self.identities and root.create_time() != self.identities[self.process.pid]:
+            current = process_identity(self.process.pid)
+            if self.process.pid in self.identities and current is not None and current != self.identities[self.process.pid]:
                 return
             for process in [root, *root.children(recursive=True)]:
                 identity = process_identity(process.pid)

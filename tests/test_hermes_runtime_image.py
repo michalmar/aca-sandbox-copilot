@@ -777,6 +777,27 @@ class RuntimeImageTests(unittest.TestCase):
         finally:
             child.stop(timeout=1)
 
+    def test_wall_clock_boot_time_shift_does_not_orphan_owned_processes(self):
+        import psutil
+        from psutil import _pslinux
+        from lifecycle import Child, process_identity
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            child = Child("clock-fixture", process)
+            child.capture()
+            self.assertEqual(child.identities[process.pid], process_identity(process.pid))
+            wall_clock = psutil.Process(process.pid).create_time()
+            shifted = _pslinux.boot_time() + 1
+            with patch.object(_pslinux, "boot_time", return_value=shifted):
+                self.assertAlmostEqual(psutil.Process(process.pid).create_time(), wall_clock + 1, delta=0.001)
+                self.assertEqual(child.live(), [process.pid])
+                child.stop(timeout=2)
+            self.assertIsNotNone(process.poll())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
     def test_native_replay_total_envelope_fits_and_reconnect_watermark_advances(self):
         from tui_gateway import event_replay, server
         event_replay.reset_replay_state()
