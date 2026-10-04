@@ -734,6 +734,8 @@ Create a Desktop OAuth client in the user's Google project and enable Gmail
 and Calendar APIs. Google onboarding needs a separate explicit decision accepting
 the personal-data flow under unrestricted MVP egress and completion of the
 applicable live deployment checks; local acceptance is not approval to connect.
+Refresh tokens issued while the OAuth app is in **Testing** expire after seven
+days; see [Publishing status and reconnect](#publishing-status-and-reconnect).
 
 The unchanged Google helper does **not** require `HERMES_EGRESS_MODE`, print the
 MVP warning, or read back Azure egress. Its Google-policy comparison does not
@@ -816,9 +818,51 @@ An API setup or sharing failure is not automatically an invalid refresh grant.
 
 To revoke access, revoke the Google grant at Google, stop the gateway, disable
 the Google runtime policy, and explicitly reconfigure. Removing a local file
-alone does not revoke the grant. External OAuth apps in Testing may require
-reconnect after seven days. WhatsApp device revocation is a separate linked-device
-action; do not confuse deleting local keys with revoking a remote device.
+alone does not revoke the grant. WhatsApp device revocation is a separate
+linked-device action; do not confuse deleting local keys with revoking a remote
+device.
+
+### Publishing status and reconnect
+
+While an External OAuth app is in **Testing**, Google issues refresh tokens for
+these scopes that expire seven days after consent. Publishing does not extend a
+token that was already issued. For a durable personal connection, publish the
+app and then connect, or reconnect once if the current credential predates
+publishing:
+
+1. In the Google Cloud project that owns the Desktop client, open
+   <https://console.cloud.google.com/auth/audience>. Under **Publishing
+   status**, select **Publish app** and confirm. Personal use does not require
+   Google verification; an unverified app is capped at 100 users. Publishing
+   lets any Google account reach the consent screen, but the helper still
+   rejects every account except `HERMES_GOOGLE_EXPECTED_EMAIL` with
+   `wrong_account`.
+2. Run `connect` on the owner computer as shown above. The helper opens the
+   consent page with Python's `webbrowser`, which honors `BROWSER`. If the
+   default browser profile belongs to another account, choose a profile for
+   this one command. For example, with Microsoft Edge on macOS, take the
+   directory name from the end of **Profile path** on `edge://version`:
+
+   ```console
+   BROWSER='open -na "Microsoft Edge" --args --profile-directory="Profile 2" --new-window %s' \
+     python scripts/google_auth_hermes.py connect --client-secrets "<local-desktop-client.json>"
+   ```
+
+   The helper never prints the authorization URL. If the page is lost or the
+   browser crashes, stop the command or let it reach the 300-second consent
+   timeout, then run it again. Nothing is uploaded in either case.
+3. On **Google hasn't verified this app**, choose **Advanced**, then **Go to
+   *app name* (unsafe)**. Grant both requested permissions; if either is left
+   unticked, the helper fails with `scope_mismatch` before uploading.
+4. Run `control.py reconfigure` in the owner shell. The Google MCP server loads
+   the credential only when it starts, so until reconfigure the gateway keeps
+   using the previously loaded token.
+5. Run `server.py --status` and expect status `connected` with code `verified`.
+
+A refresh token issued after publishing still stops working when the grant is
+revoked, when the account password changes (the grant includes Gmail scopes),
+or after six months without use. Reconnect with the same steps. This procedure
+was completed live on 2026-10-04.
 
 ## Checks and recovery
 
