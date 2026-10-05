@@ -232,14 +232,17 @@ MVP choice reinterprets those unknown fields or establishes hardened support.
 | Foundry | A supplied existing inference API base, deployment, API mode, context length, and `https://ai.azure.com/.default` scope. For chat completions, include the full `/openai/v1` base. Group managed identity, in-memory tokens; no static API key or automatic model/RBAC provisioning. |
 | Browser ingress | Exactly one HTTP 8080 `OnDemand` port. Default `HERMES_INGRESS_MODE=entra`: anonymous disabled, exact owner object-ID ACL; tenant-wide membership is not equivalent to owner authorization. Explicit `anonymous-key`: no platform authentication or identity filter; only the inner proxy's rotating transport key protects the dashboard. |
 | Dashboard | Real native dashboard on `127.0.0.1:9119`; no public 9119, 8642, or 3000. Browser uses the local owner relay, not the raw ingress URL. |
-| Tools | Only `clarify` and `memory`, plus exactly three Google read-only tools when eligible. No generic filesystem, shell, browser, install, scheduling, or configuration tools. |
+| Tools | `clarify`, `memory`, full local `terminal`, public `web`, and `browser`, plus exactly three Google read-only tools when eligible. Private-network URLs, lazy installs, scheduling, configuration mutation, and unrelated integrations remain disabled. |
 | WhatsApp | Owner self-chat only, text only, locally authenticated bridge. Pairing is explicit and interactive; device keys are sensitive persistent data. |
 | Google | Gmail read-only and Calendar events read-only scopes, exact account and calendar allowlists, no attachments or writes. |
 | Egress | Deliberate temporary `allow-all-mvp`: `None` inspection + `Allow` default, no rules and **no outbound isolation**. Missing/unknown/hardened-unverified modes block deploy/test/access; no guest package installation or automatic fallback. |
 
-The runtime is a deliberately constrained assistant, not an arbitrary-code
-workspace. Native CLI/TUI dispatch and model-visible tool arrays are separately
-guarded; an HTTP route allowlist alone would not constrain PTY input.
+The runtime is an owner-operated assistant with model-visible terminal and web
+access inside the Sandbox. Native CLI/TUI dispatch and model-visible tool arrays
+are separately guarded; an HTTP route allowlist alone would not constrain PTY
+input. Terminal and unrestricted public egress can expose or exfiltrate data, so
+the profile keeps private-network URLs, lazy installs, configuration mutation,
+scheduling and unrelated integrations disabled.
 The dashboard's native `session.create` may supply `cwd` only as the exact
 `/mnt/data` workspace; arbitrary paths and alternate spellings remain forbidden.
 The native read-only `/context` command has an exact, argument-free TUI grammar;
@@ -260,9 +263,10 @@ literal. The visible refusal is `Context references are disabled in managed
 Sandbox mode.`; it does not imply the requested content was read.
 
 The upstream tirith command scanner is disabled with
-`security.tirith_enabled: false`. No shell tool is exposed for it to assess,
-and its gateway-startup download would place an unmanaged executable in the
-profile's `bin` directory, which the single-profile check rejects.
+`security.tirith_enabled: false`. The model-visible terminal is available, but
+tirith's gateway-startup download would place an unmanaged executable in the
+profile's `bin` directory, which the single-profile check rejects. Terminal
+commands therefore run without this optional downloaded scanner.
 
 For this pilot's `gpt-6-sol` deployment, the managed Azure Foundry provider sends
 explicit `reasoning_effort: "none"` for chat completions. The generic upstream

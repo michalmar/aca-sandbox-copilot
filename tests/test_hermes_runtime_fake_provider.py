@@ -82,7 +82,7 @@ def install() -> None:
         if hidden_tool:
             message = {"role": "assistant", "content": None, "tool_calls": [{
                 "id": "offline-hidden-call", "type": "function", "function": {
-                    "name": "terminal",
+                    "name": "discord_send",
                     "arguments": json.dumps({
                         "command": "printf forbidden > /mnt/data/forbidden-tool-executed",
                     }),

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from runtime import (
-    ALLOWED_TOOLSETS, BASE_TOOLS, BUNDLES, CONCRETE_TOOLSETS, HOME, MCP_TOOLS,
+    ALLOWED_TOOLSETS, BUNDLES, CONCRETE_TOOLSETS, HOME, MCP_TOOLS, MODEL_TOOLSETS,
     PolicyError, REGISTRY_ONLY_TOOLSETS, SUPPORT, check_single_profile, managed_config, read_json,
     read_state, validate_profile,
 )
@@ -112,21 +112,26 @@ def select_tools(enabled: list[str] | None) -> list[str]:
     registry_contract()
     if enabled is not None and (not isinstance(enabled, (list, tuple))
                                or set(enabled) - ALLOWED_TOOLSETS - {"hermes-cli", "hermes-whatsapp"}):
-        raise PolicyError("managed mode permits only memory, clarify and google_readonly toolsets")
+        raise PolicyError(
+            "managed mode permits only memory, clarify, terminal, web, browser and google_readonly toolsets"
+        )
     policy = read_json(HOME / "profile-policy.json")
-    return ["memory", "clarify"] + (["mcp-google_readonly"] if policy["google_configured"] else [])
+    return ["memory", "clarify", "terminal", "web", "browser"] + (
+        ["mcp-google_readonly"] if policy["google_configured"] else []
+    )
 
 
 def allowed_names() -> frozenset[str]:
     from tools.registry import registry
     runtime = checked_runtime()
     registry_contract()
-    available = set(registry.get_tool_to_toolset_map())
+    inventory = registry.get_tool_to_toolset_map()
+    available = set(inventory)
     configured = read_json(HOME / "profile-policy.json")["google_configured"]
     google = MCP_TOOLS & available if runtime["google"]["enabled"] and configured else frozenset()
     if google and google != MCP_TOOLS:
         raise PolicyError("Google registry must expose exactly the three approved tools")
-    return BASE_TOOLS | google
+    return frozenset(name for name, toolset in inventory.items() if toolset in MODEL_TOOLSETS) | google
 
 
 def check_tool_name(name: str) -> None:

@@ -78,7 +78,8 @@ class RuntimeImageTests(unittest.TestCase):
 
     def expected_tools(self):
         runtime = self.runtime_module
-        return runtime.BASE_TOOLS | (runtime.MCP_TOOLS if self.runtime["google"]["enabled"] else frozenset())
+        from managed_policy import allowed_names
+        return allowed_names()
 
     def assert_no_external_attempts(self, capture):
         attempts = Path(str(capture) + ".network-attempts")
@@ -878,9 +879,9 @@ class RuntimeImageTests(unittest.TestCase):
                 main = [record for record in records if record["tools"] is not None]
                 self.assertTrue(main, result.stdout + result.stderr)
                 for record in main:
-                    self.assertEqual(set(record["tools"]), runtime.BASE_TOOLS | runtime.MCP_TOOLS,
+                    self.assertEqual(set(record["tools"]), self.expected_tools(),
                                      result.stdout + result.stderr)
-                    self.assertEqual(len(record["tools"]), 5)
+                    self.assertGreater(len(record["tools"]), 5)
                     self.assertTrue(record["test_bearer"])
                 self.assert_no_external_attempts(capture)
                 operations = Path(str(capture) + ".google-operations")
@@ -1077,12 +1078,12 @@ class RuntimeImageTests(unittest.TestCase):
         self.assertTrue(any(record["hidden_tool_emitted"] for record in records), records)
         replies = [content.lower() for record in records for content in record["tool_results"]]
         self.assertTrue(any("denied" in reply or "not available" in reply or "not enabled" in reply
-                            or "unknown tool" in reply or "tool 'terminal' does not exist" in reply
+                            or "unknown tool" in reply or "tool 'discord_send' does not exist" in reply
                             for reply in replies), replies)
         for record in records:
             if record["tools"] is not None:
-                self.assertEqual(set(record["tools"]), {"memory", "clarify"})
-                self.assertEqual(len(record["tools"]), 2)
+                self.assertEqual(set(record["tools"]), self.expected_tools())
+                self.assertNotIn("discord_send", record["tools"])
         self.assert_no_external_attempts(capture)
 
     def test_real_dashboard_chat_pty_emits_exact_tools(self):

@@ -137,14 +137,21 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertFalse(config["security"]["allow_lazy_installs"])
         self.assertFalse(config["security"]["tirith_enabled"])
         self.assertEqual(config["tools"]["tool_search"]["enabled"], "off")
-        self.assertFalse(config["web"]["keyless_fallback"])
+        self.assertTrue(config["web"]["keyless_fallback"])
         for auxiliary in config["auxiliary"].values():
             self.assertEqual(auxiliary["provider"], "azure-foundry")
             self.assertEqual(auxiliary["model"], self.value["foundry"]["deployment"])
         for platform, toolsets in config["platform_toolsets"].items():
-            self.assertEqual(toolsets, ["memory", "clarify"] if platform in {"cli", "tui", "whatsapp"} else [])
+            self.assertEqual(
+                toolsets,
+                ["memory", "clarify", "terminal", "web", "browser"]
+                if platform in {"cli", "tui", "whatsapp"} else [],
+            )
         self.assertNotIn("hermes-cli", config["agent"]["disabled_toolsets"])
-        self.assertEqual(set(config["agent"]["disabled_toolsets"]), runtime.CONCRETE_TOOLSETS - runtime.BASE_TOOLS)
+        self.assertEqual(
+            set(config["agent"]["disabled_toolsets"]),
+            runtime.CONCRETE_TOOLSETS - runtime.MODEL_TOOLSETS,
+        )
 
     def test_schema_rejects_unknown_secret_fields_and_wrong_types(self):
         mutations = [
@@ -209,7 +216,7 @@ class RuntimeContractTests(unittest.TestCase):
     def test_profile_drift_fails_without_repair(self):
         runtime.apply_profile(self.value, home=self.home, configured=False)
         config = json.loads((self.home / "config.yaml").read_text())
-        config["platform_toolsets"]["cli"].append("terminal")
+        config["platform_toolsets"]["cli"].remove("terminal")
         runtime.atomic_json(self.home / "config.yaml", config)
         before = (self.home / "config.yaml").read_bytes()
         with self.assertRaisesRegex(runtime.PolicyError, "drift"):
