@@ -59,7 +59,9 @@ RUN npm install -g --registry "$NPM_REGISTRY" --ignore-scripts --no-audit --no-f
     agent-browser@0.38.2 && \
     agent-browser install && \
     agent-browser --version | grep -Eq '(^|[[:space:]])0\.38\.2$' && \
-    test -x /root/.agent-browser/browsers/chrome-154.0.8037.92/chrome-linux64/chrome
+    chrome="$(find /root/.agent-browser/browsers -type f -name chrome -perm /111 -print -quit)" && \
+    test -n "$chrome" && \
+    ln -s "$chrome" /usr/local/bin/google-chrome
 RUN cd scripts/whatsapp-bridge && npm ci --registry "$NPM_REGISTRY" --ignore-scripts --no-audit --no-fund && \
     node -e "const f=require('fs'),c=require('crypto');f.writeFileSync('node_modules/.hermes-pkg-hash',c.createHash('sha256').update(f.readFileSync('package.json')).digest('hex').slice(0,16))"
 RUN .venv/bin/python /opt/hermes-sandbox/build_dependencies.py verify
@@ -78,7 +80,6 @@ RUN test -f /opt/hermes-sandbox/access_proxy.py && \
     .venv/bin/python /opt/hermes-sandbox/build_dependencies.py registry && \
     .venv/bin/python /opt/hermes-sandbox/build_dependencies.py integration
 ENV PATH="/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-    AGENT_BROWSER_EXECUTABLE_PATH=/root/.agent-browser/browsers/chrome-154.0.8037.92/chrome-linux64/chrome \
     HERMES_HOME=/mnt/data/hermes \
     HERMES_TUI_DIR=/opt/hermes/ui-tui \
     HERMES_PYTHON_PATH=/opt/hermes/.venv/bin/python \
