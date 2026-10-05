@@ -13,7 +13,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NPM_CONFIG_UPDATE_NOTIFIER=false
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ca-certificates curl git tini tzdata python3.12 python3.12-venv python3.12-dev \
-    build-essential pkg-config libffi-dev libssl-dev && \
+    build-essential pkg-config libffi-dev libssl-dev \
+    libxcb-shm0 libx11-xcb1 libx11-6 libxcb1 libxext6 libxrandr2 libxcomposite1 \
+    libxcursor1 libxdamage1 libxfixes3 libxi6 libgtk-3-0 libpangocairo-1.0-0 \
+    libpango-1.0-0 libatk1.0-0 libcairo-gobject2 libcairo2 libgdk-pixbuf-2.0-0 \
+    libxrender1 libasound2t64 libfreetype6 libfontconfig1 libdbus-1-3 libnss3 \
+    libnss3-tools libnspr4 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libatspi2.0-0 \
+    libcups2 libxshmfence1 libgbm1 fonts-noto-color-emoji fonts-noto-cjk \
+    fonts-freefont-ttf && \
     apt-get clean && rm -rf /var/lib/apt/lists
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
@@ -50,7 +57,7 @@ RUN .venv/bin/python /opt/hermes-sandbox/build_dependencies.py frontend-lock-exc
     npm run build --workspace web
 RUN npm install -g --registry "$NPM_REGISTRY" --ignore-scripts --no-audit --no-fund \
     agent-browser@0.38.2 && \
-    agent-browser install --with-deps && \
+    agent-browser install && \
     agent-browser --version | grep -Eq '(^|[[:space:]])0\.38\.2$'
 RUN cd scripts/whatsapp-bridge && npm ci --registry "$NPM_REGISTRY" --ignore-scripts --no-audit --no-fund && \
     node -e "const f=require('fs'),c=require('crypto');f.writeFileSync('node_modules/.hermes-pkg-hash',c.createHash('sha256').update(f.readFileSync('package.json')).digest('hex').slice(0,16))"
