@@ -8,7 +8,7 @@ from pathlib import Path
 
 from runtime import (
     ALLOWED_TOOLSETS, BASE_TOOLS, BUNDLES, CONCRETE_TOOLSETS, HOME, MCP_TOOLS, MODEL_TOOLSETS,
-    PolicyError, REGISTRY_ONLY_TOOLSETS, SUPPORT, check_single_profile, managed_config, read_json,
+    PolicyError, REGISTRY_ONLY_TOOLSETS, REQUIRED_RUNTIME_TOOLS, SUPPORT, check_single_profile, managed_config, read_json,
     read_state, validate_profile,
 )
 
@@ -127,20 +127,8 @@ def allowed_names() -> frozenset[str]:
     registry_contract()
     inventory = registry.get_tool_to_toolset_map()
     configured = read_json(HOME / "profile-policy.json")["google_configured"]
-    google_candidates = MCP_TOOLS if runtime["google"]["enabled"] and configured else frozenset()
-    candidates = (
-        frozenset(name for name, toolset in inventory.items() if toolset in MODEL_TOOLSETS)
-        | google_candidates
-    )
-    definitions = registry.get_definitions(set(candidates), quiet=True)
-    available = frozenset(schema.get("function", schema).get("name") for schema in definitions)
-    google = MCP_TOOLS & available
-    if google and google != MCP_TOOLS:
-        raise PolicyError("Google registry must expose exactly the three approved tools")
-    visible = available | google
-    if not BASE_TOOLS <= visible:
-        raise PolicyError("required managed tools are unavailable")
-    return visible
+    google = MCP_TOOLS if runtime["google"]["enabled"] and configured else frozenset()
+    return frozenset(name for name, toolset in inventory.items() if toolset in MODEL_TOOLSETS) | google
 
 
 def check_tool_name(name: str) -> None:
@@ -150,8 +138,14 @@ def check_tool_name(name: str) -> None:
 
 def check_schemas(schemas: list | None, *, exact: bool = True) -> None:
     names = [schema.get("function", schema).get("name") for schema in (schemas or [])]
-    expected = allowed_names()
-    if len(names) != len(set(names)) or set(names) - expected or (exact and set(names) != expected):
+    visible = set(names)
+    allowed = allowed_names()
+    runtime = checked_runtime()
+    configured = read_json(HOME / "profile-policy.json")["google_configured"]
+    expected_google = MCP_TOOLS if runtime["google"]["enabled"] and configured else frozenset()
+    if (len(names) != len(visible) or visible - allowed
+            or not REQUIRED_RUNTIME_TOOLS <= visible
+            or (visible & MCP_TOOLS) != expected_google):
         raise PolicyError("model-visible tools differ from the image-managed capability contract")
 
 

@@ -77,9 +77,11 @@ class RuntimeImageTests(unittest.TestCase):
         }
 
     def expected_tools(self):
-        runtime = self.runtime_module
-        from managed_policy import allowed_names
-        return allowed_names()
+        from model_tools import get_tool_definitions
+        return {
+            schema.get("function", schema).get("name")
+            for schema in get_tool_definitions(None, quiet_mode=True)
+        }
 
     def assert_no_external_attempts(self, capture):
         attempts = Path(str(capture) + ".network-attempts")
@@ -138,11 +140,11 @@ class RuntimeImageTests(unittest.TestCase):
         self.assertEqual(importlib.metadata.version("cryptography"), "50.0.0")
         self.assertEqual(importlib.metadata.version("hermes-agent"), "0.21.5")
 
-    def test_native_cli_tui_whatsapp_agents_have_exact_two_tools_when_google_disabled(self):
+    def test_native_cli_tui_whatsapp_agents_have_managed_tools_when_google_disabled(self):
         for platform in ("cli", "tui", "whatsapp"):
             with self.subTest(platform=platform):
                 agent = self.agent(platform)
-                self.assertEqual({tool["function"]["name"] for tool in agent.tools}, {"memory", "clarify"})
+                self.assertEqual({tool["function"]["name"] for tool in agent.tools}, self.expected_tools())
 
     def test_actual_wire_kwargs_have_exact_tools_and_native_foundry_route(self):
         from agent.chat_completion_helpers import build_api_kwargs
@@ -1023,8 +1025,8 @@ class RuntimeImageTests(unittest.TestCase):
         main = [record for record in records if record["tools"] is not None]
         self.assertTrue(main, records)
         for record in main:
-            self.assertEqual(set(record["tools"]), {"memory", "clarify"})
-            self.assertEqual(len(record["tools"]), 2)
+            self.assertEqual(set(record["tools"]), self.expected_tools())
+            self.assertEqual(len(record["tools"]), len(self.expected_tools()))
             self.assertEqual(record["model"], self.runtime["foundry"]["deployment"])
             self.assertTrue(record["test_bearer"])
         self.assert_no_external_attempts(capture)

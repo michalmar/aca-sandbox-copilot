@@ -48,6 +48,10 @@ RUN .venv/bin/python /opt/hermes-sandbox/build_dependencies.py frontend-lock-exc
     npm rebuild esbuild && \
     npm run build --workspace ui-tui && \
     npm run build --workspace web
+RUN npm install -g --registry "$NPM_REGISTRY" --ignore-scripts --no-audit --no-fund \
+    agent-browser@0.38.2 && \
+    agent-browser install --with-deps && \
+    agent-browser --version | grep -Eq '(^|[[:space:]])0\.38\.2$'
 RUN cd scripts/whatsapp-bridge && npm ci --registry "$NPM_REGISTRY" --ignore-scripts --no-audit --no-fund && \
     node -e "const f=require('fs'),c=require('crypto');f.writeFileSync('node_modules/.hermes-pkg-hash',c.createHash('sha256').update(f.readFileSync('package.json')).digest('hex').slice(0,16))"
 RUN .venv/bin/python /opt/hermes-sandbox/build_dependencies.py verify
