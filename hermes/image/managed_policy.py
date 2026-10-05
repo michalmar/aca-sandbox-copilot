@@ -143,9 +143,10 @@ def check_schemas(schemas: list | None, *, exact: bool = True) -> None:
     runtime = checked_runtime()
     configured = read_json(HOME / "profile-policy.json")["google_configured"]
     expected_google = MCP_TOOLS if runtime["google"]["enabled"] and configured else frozenset()
+    visible_google = visible & MCP_TOOLS
     if (len(names) != len(visible) or visible - allowed
             or not REQUIRED_RUNTIME_TOOLS <= visible
-            or (exact and (visible & MCP_TOOLS) != expected_google)):
+            or (visible_google and visible_google != expected_google)):
         raise PolicyError("model-visible tools differ from the image-managed capability contract")
 
 
