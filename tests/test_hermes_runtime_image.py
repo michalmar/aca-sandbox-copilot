@@ -84,7 +84,7 @@ class RuntimeImageTests(unittest.TestCase):
             "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
         }
         self.assertTrue(required <= names, names)
-        self.assertFalse(names - allowed_names(), names)
+        self.assertFalse(names - (allowed_names() | self.runtime_module.MCP_TOOLS), names)
         google = names & self.runtime_module.MCP_TOOLS
         self.assertEqual(
             google,
