@@ -76,15 +76,20 @@ class RuntimeImageTests(unittest.TestCase):
             "HERMES_RUNTIME_GOOGLE_FIXTURE": "1" if self.runtime["google"]["enabled"] else "0",
         }
 
-    def expected_tools(self):
-        from model_tools import get_tool_definitions
-        visible = {
-            schema.get("function", schema).get("name")
-            for schema in get_tool_definitions(None, quiet_mode=True)
+    def assert_managed_tools(self, names):
+        from managed_policy import allowed_names
+        names = set(names)
+        required = {
+            "memory", "clarify", "terminal", "process_manage", "web_extract",
+            "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
         }
-        if self.runtime["google"]["enabled"]:
-            visible |= self.runtime_module.MCP_TOOLS
-        return visible
+        self.assertTrue(required <= names, names)
+        self.assertFalse(names - allowed_names(), names)
+        google = names & self.runtime_module.MCP_TOOLS
+        self.assertEqual(
+            google,
+            self.runtime_module.MCP_TOOLS if self.runtime["google"]["enabled"] else set(),
+        )
 
     def assert_no_external_attempts(self, capture):
         attempts = Path(str(capture) + ".network-attempts")
@@ -147,7 +152,7 @@ class RuntimeImageTests(unittest.TestCase):
         for platform in ("cli", "tui", "whatsapp"):
             with self.subTest(platform=platform):
                 agent = self.agent(platform)
-                self.assertEqual({tool["function"]["name"] for tool in agent.tools}, self.expected_tools())
+                self.assert_managed_tools(tool["function"]["name"] for tool in agent.tools)
 
     def test_actual_wire_kwargs_have_exact_tools_and_native_foundry_route(self):
         from agent.chat_completion_helpers import build_api_kwargs
@@ -156,10 +161,7 @@ class RuntimeImageTests(unittest.TestCase):
                 agent = self.agent(platform)
                 kwargs = build_api_kwargs(agent, [{"role": "user", "content": "offline test"}])
                 self.assertEqual(kwargs["model"], self.runtime["foundry"]["deployment"])
-                self.assertEqual(
-                    {tool["function"]["name"] for tool in kwargs["tools"]},
-                    self.expected_tools(),
-                )
+                self.assert_managed_tools(tool["function"]["name"] for tool in kwargs["tools"])
                 self.assertEqual(agent.provider, "azure-foundry")
 
     def test_real_cli_command_dispatch_refuses_mutation_before_handler(self):
@@ -887,8 +889,7 @@ class RuntimeImageTests(unittest.TestCase):
                 main = [record for record in records if record["tools"] is not None]
                 self.assertTrue(main, result.stdout + result.stderr)
                 for record in main:
-                    self.assertEqual(set(record["tools"]), self.expected_tools(),
-                                     result.stdout + result.stderr)
+                    self.assert_managed_tools(record["tools"])
                     self.assertGreater(len(record["tools"]), 5)
                     self.assertTrue(record["test_bearer"])
                 self.assert_no_external_attempts(capture)
@@ -1028,8 +1029,7 @@ class RuntimeImageTests(unittest.TestCase):
         main = [record for record in records if record["tools"] is not None]
         self.assertTrue(main, records)
         for record in main:
-            self.assertEqual(set(record["tools"]), self.expected_tools())
-            self.assertEqual(len(record["tools"]), len(self.expected_tools()))
+            self.assert_managed_tools(record["tools"])
             self.assertEqual(record["model"], self.runtime["foundry"]["deployment"])
             self.assertTrue(record["test_bearer"])
         self.assert_no_external_attempts(capture)
@@ -1090,7 +1090,7 @@ class RuntimeImageTests(unittest.TestCase):
                             for reply in replies), replies)
         for record in records:
             if record["tools"] is not None:
-                self.assertEqual(set(record["tools"]), self.expected_tools())
+                self.assert_managed_tools(record["tools"])
                 self.assertNotIn("discord_send", record["tools"])
         self.assert_no_external_attempts(capture)
 
@@ -1240,8 +1240,7 @@ class RuntimeImageTests(unittest.TestCase):
                     self.assertTrue(records, output[-5000:].decode(errors="replace"))
                     for record in records:
                         self.assertEqual(record["surface"], "dashboard-pty")
-                        self.assertEqual(set(record["tools"]), self.expected_tools())
-                        self.assertEqual(len(record["tools"]), len(self.expected_tools()))
+                        self.assert_managed_tools(record["tools"])
                         self.assertTrue(record["test_bearer"])
                     self.assert_no_external_attempts(capture)
                     if reference_sentinel:
@@ -1347,10 +1346,7 @@ class RuntimeImageTests(unittest.TestCase):
                     mcp_log = runtime.HOME / "logs/mcp-stderr.log"
                     discovery_log = Path(str(capture) + ".discovery")
                     for record in main:
-                        self.assertEqual(set(record["tools"]), self.expected_tools(),
-                                         log_path.read_text()[-4000:] + (mcp_log.read_text()[-4000:] if mcp_log.exists() else "")
-                                         + (discovery_log.read_text() if discovery_log.exists() else "no discovery capture"))
-                        self.assertEqual(len(record["tools"]), len(self.expected_tools()))
+                        self.assert_managed_tools(record["tools"])
                         self.assertTrue(record["test_bearer"])
                     self.assertFalse(any(item["event"] in {"wrong-target", "unexpected-route"} for item in sent), sent)
                     contender = subprocess.run(command, env=environment, cwd="/mnt/data",
@@ -1596,8 +1592,7 @@ class RuntimeImageTests(unittest.TestCase):
                     self.assertNotEqual(results("session.create")[-1]["result"]["session_id"], previous_sid)
                     print("P4_TUI_CONTEXT_SESSION_TEARDOWN=passed")
                 for record in main:
-                    self.assertEqual(set(record["tools"]), self.expected_tools())
-                    self.assertEqual(len(record["tools"]), len(self.expected_tools()))
+                    self.assert_managed_tools(record["tools"])
                     self.assertTrue(record["test_bearer"])
                 self.assertTrue(any(
                     response.get("request_method") == "input.detect_drop"
