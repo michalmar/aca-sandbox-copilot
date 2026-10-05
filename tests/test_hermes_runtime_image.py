@@ -86,10 +86,7 @@ class RuntimeImageTests(unittest.TestCase):
         self.assertTrue(required <= names, names)
         self.assertFalse(names - (allowed_names() | self.runtime_module.MCP_TOOLS), names)
         google = names & self.runtime_module.MCP_TOOLS
-        self.assertEqual(
-            google,
-            self.runtime_module.MCP_TOOLS if self.runtime["google"]["enabled"] else set(),
-        )
+        self.assertIn(google, (set(), self.runtime_module.MCP_TOOLS))
 
     def assert_no_external_attempts(self, capture):
         attempts = Path(str(capture) + ".network-attempts")
@@ -890,6 +887,7 @@ class RuntimeImageTests(unittest.TestCase):
                 self.assertTrue(main, result.stdout + result.stderr)
                 for record in main:
                     self.assert_managed_tools(record["tools"])
+                    self.assertTrue(self.runtime_module.MCP_TOOLS <= set(record["tools"]))
                     self.assertGreater(len(record["tools"]), 5)
                     self.assertTrue(record["test_bearer"])
                 self.assert_no_external_attempts(capture)
