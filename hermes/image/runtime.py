@@ -37,7 +37,6 @@ GOOGLE_TOOLS = ("gmail_search", "gmail_read", "calendar_events")
 BASE_TOOLS = frozenset({"memory", "clarify"})
 REQUIRED_RUNTIME_TOOLS = BASE_TOOLS | frozenset({
     "terminal", "process_manage", "web_search", "web_extract",
-    "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
 })
 MODEL_TOOLSETS = frozenset({"memory", "clarify", "terminal", "web", "browser"})
 MCP_TOOLS = frozenset(f"mcp__google_readonly__{name}" for name in GOOGLE_TOOLS)

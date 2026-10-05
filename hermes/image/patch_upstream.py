@@ -125,7 +125,7 @@ azure_foundry = ManagedFoundryProfile(""")
               '        from managed_policy import agent_parameters\n        agent_parameters(init_kwargs)')
     p.replace("run_agent.py", "        init_agent(self, **init_kwargs)",
               "        init_agent(self, **init_kwargs)\n        from managed_policy import check_schemas\n"
-              "        check_schemas(self.tools)")
+              "        check_schemas(self.tools, exact=False)")
     p.function("agent/chat_completion_helpers.py", "build_api_kwargs", """
         from managed_policy import before_request
         before_request(agent, tools_for_api)

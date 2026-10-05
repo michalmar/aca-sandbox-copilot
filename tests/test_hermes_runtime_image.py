@@ -78,10 +78,13 @@ class RuntimeImageTests(unittest.TestCase):
 
     def expected_tools(self):
         from model_tools import get_tool_definitions
-        return {
+        visible = {
             schema.get("function", schema).get("name")
             for schema in get_tool_definitions(None, quiet_mode=True)
         }
+        if self.runtime["google"]["enabled"]:
+            visible |= self.runtime_module.MCP_TOOLS
+        return visible
 
     def assert_no_external_attempts(self, capture):
         attempts = Path(str(capture) + ".network-attempts")
