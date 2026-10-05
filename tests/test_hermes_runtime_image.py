@@ -151,7 +151,10 @@ class RuntimeImageTests(unittest.TestCase):
                 agent = self.agent(platform)
                 kwargs = build_api_kwargs(agent, [{"role": "user", "content": "offline test"}])
                 self.assertEqual(kwargs["model"], self.runtime["foundry"]["deployment"])
-                self.assertEqual({tool["function"]["name"] for tool in kwargs["tools"]}, {"memory", "clarify"})
+                self.assertEqual(
+                    {tool["function"]["name"] for tool in kwargs["tools"]},
+                    self.expected_tools(),
+                )
                 self.assertEqual(agent.provider, "azure-foundry")
 
     def test_real_cli_command_dispatch_refuses_mutation_before_handler(self):
@@ -173,12 +176,12 @@ class RuntimeImageTests(unittest.TestCase):
             self.assertEqual(run_bang_command("echo forbidden", writer=messages.append), 126)
         self.assertTrue(messages)
 
-    def test_real_tool_dispatch_and_registry_dispatch_deny_generic_http_shell_and_files(self):
+    def test_real_tool_dispatch_and_registry_dispatch_deny_unapproved_tools(self):
         from model_tools import handle_function_call
         from tools.registry import registry
         from runtime import PolicyError
-        for name in ("terminal", "execute_code", "read_file", "write_file", "web_fetch", "delegate_task",
-                     "browser_navigate", "skill_view", "unknown_tool"):
+        for name in ("execute_code", "read_file", "write_file", "web_fetch", "delegate_task",
+                     "skill_view", "unknown_tool"):
             with self.subTest(tool=name):
                 with self.assertRaises(PolicyError):
                     handle_function_call(name, {})
